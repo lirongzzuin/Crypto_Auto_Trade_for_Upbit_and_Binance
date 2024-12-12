@@ -1,0 +1,6 @@
+requests
+pandas
+numpy
+logging
+pyupbit
+python-dotenv
