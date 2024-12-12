@@ -51,14 +51,12 @@ def calculate_rsi(prices, window=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-
 def calculate_macd(prices):
     ema12 = prices.ewm(span=12, adjust=False).mean()
     ema26 = prices.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
     macd_signal = macd.ewm(span=9, adjust=False).mean()
     return macd, macd_signal
-
 
 def calculate_adx(df, window=14):
     high = df["high_price"]
@@ -72,7 +70,6 @@ def calculate_adx(df, window=14):
     minus_di = 100 * (pd.Series(minus_dm).rolling(window=window).mean() / atr)
     dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
     return dx.rolling(window=window).mean()
-
 
 def calculate_supertrend(df, atr_period=10, multiplier=3):
     atr = calculate_atr(df, atr_period)
@@ -91,7 +88,6 @@ def calculate_supertrend(df, atr_period=10, multiplier=3):
     df["supertrend"] = df["supertrend"].ffill()
     return df
 
-
 def calculate_atr(df, window):
     high = df["high_price"]
     low = df["low_price"]
@@ -99,11 +95,9 @@ def calculate_atr(df, window):
     tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
     return tr.rolling(window=window).mean()
 
-
 def calculate_volume_momentum(df):
     volume = df["candle_acc_trade_volume"]
     return volume.pct_change().rolling(window=5).mean()
-
 
 def calculate_indicators(df):
     """데이터프레임에 필요한 지표를 추가"""
@@ -113,7 +107,6 @@ def calculate_indicators(df):
     df = calculate_supertrend(df)
     df["volume_momentum"] = calculate_volume_momentum(df)
     return df
-
 
 def calculate_dynamic_thresholds(df):
     atr = calculate_atr(df, 14).iloc[-1]
@@ -129,7 +122,6 @@ def get_markets():
         return [market["market"] for market in response.json() if market["market"].startswith("KRW")]
     logger.error(f"Failed to fetch markets: {response.status_code}")
     return []
-
 
 def get_candles_minutes(market, unit=1, count=200, retries=3, delay=10):
     url = f"{SERVER_URL}/v1/candles/minutes/{unit}"
@@ -154,6 +146,22 @@ def send_slack_message(message):
         requests.post(SLACK_WEBHOOK_URL, json=payload)
     except Exception as e:
         logger.error(f"Slack message failed: {e}")
+
+def get_order_details(market):
+    """주문 완료 정보를 가져옵니다."""
+    url = f"{SERVER_URL}/v1/orders/closed"
+    headers = {"Authorization": f"Bearer {ACCESS_KEY}"}
+    params = {"market": market, "state": "done", "order_by": "desc"}
+
+    try:
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            logger.error(f"Failed to fetch order details for {market}: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Error fetching order details for {market}: {e}")
+    return []
 
 def get_balance(ticker):
     balances = upbit.get_balances()
@@ -192,19 +200,20 @@ def get_order(uuid_or_market, state='done'):
 
 def calculate_profit_from_orders(market):
     """주문 완료 정보를 기준으로 누적 수익 계산"""
-    orders = get_order(market)
+    orders = get_order_details(market)
     if not orders:
-        return 0
+        return 0.0
 
-    profit = 0.0
+    total_profit = 0.0
     for order in orders:
         if order["side"] == "ask":
             sell_price = float(order["price"])
             executed_volume = float(order["executed_volume"])
             buy_price = buy_prices.get(market, 0)
             if buy_price > 0:
-                profit += (sell_price - buy_price) * executed_volume - float(order.get("paid_fee", 0))
-    return profit
+                profit = (sell_price - buy_price) * executed_volume - float(order.get("paid_fee", 0))
+                total_profit += profit
+    return total_profit
 
 def handle_stop_signal(signal_received, frame):
     global total_profit
@@ -259,7 +268,6 @@ def track_sell_signals():
     global total_profit, last_sell_signal_check
     current_time = time.time()
 
-    # 30분 간격으로 매도 신호 추적 알림
     if current_time - last_sell_signal_check >= SELL_SIGNAL_CHECK_INTERVAL:
         owned_coins = get_owned_coins()
         if owned_coins:
@@ -284,7 +292,7 @@ def track_sell_signals():
         time_since_buy = time.time() - last_buy_time.get(market, 0)
 
         # 조건 1: 목표 수익률 달성 시 매도
-        if profit_ratio >= 7.0:  # 목표 수익률 7%
+        if profit_ratio >= 7.0:
             send_slack_message(f"[Sell Signal - Target Profit] Market: {market}, Profit Ratio: {profit_ratio:.2f}%")
             order = place_market_order("ask", market, volume=volume)
             if order:
@@ -308,7 +316,7 @@ def track_sell_signals():
                 continue
 
         # 조건 3: 손실 한계 도달 시 손절
-        if profit_ratio <= -5.0:  # 손실 -5%
+        if profit_ratio <= -5.0:
             send_slack_message(f"[Sell Signal - Stop Loss] Market: {market}, Loss Ratio: {profit_ratio:.2f}%")
             order = place_market_order("ask", market, volume=volume)
             if order:
