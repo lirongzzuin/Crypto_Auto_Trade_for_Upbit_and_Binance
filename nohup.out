@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/Users/leeyounggyun/PycharmProjects/PythonProject/auto_trade/bitcoin_price_alert.py", line 68, in <module>
+    monitor_prices()
+  File "/Users/leeyounggyun/PycharmProjects/PythonProject/auto_trade/bitcoin_price_alert.py", line 65, in monitor_prices
+    sleep(30)  # Check prices every 30 seconds
+KeyboardInterrupt
