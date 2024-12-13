@@ -14,9 +14,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # 환경 설정
-ACCESS_KEY = os.getenv("ACCESS_KEY")
-SECRET_KEY = os.getenv("SECRET_KEY")
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+ACCESS_KEY_UPBIT = os.getenv("ACCESS_KEY_UPBIT")
+SECRET_KEY_UPBIT = os.getenv("SECRET_KEY_UPBIT")
+SLACK_WEBHOOK_URL_UPBIT = os.getenv("SLACK_WEBHOOK_URL_UPBIT")
 SERVER_URL = 'https://api.upbit.com'
 
 # 로깅 설정
@@ -265,18 +265,6 @@ def get_owned_coins():
         if float(b['balance']) > MINIMUM_VOLUME_THRESHOLD and float(b['balance']) * float(b['avg_buy_price']) >= MINIMUM_EVALUATION_KRW
     }
 
-# def initialize_buy_prices():
-#     """보유한 코인의 매수 가격을 초기화합니다."""
-#     owned_coins = get_owned_coins()
-#     for market in owned_coins.keys():
-#         orders = get_order_details(market)
-#         if orders:
-#             for order in orders:
-#                 if order["side"] == "bid" and float(order["executed_volume"]) > 0:
-#                     # 가장 최근 매수 가격을 저장
-#                     buy_prices[market] = float(order["price"])
-#                     break
-
 def track_buy_signals():
     """매수 시그널 추적 및 매수 실행"""
     global total_invested
@@ -307,11 +295,12 @@ def track_buy_signals():
         df = calculate_indicators(df)
 
         if (
-                df["rsi"].iloc[-1] < 40 and  # RSI 완화
-                df["macd"].iloc[-1] > 0 and  # MACD 양수
-                df["adx"].iloc[-1] > 20 and  # ADX 완화
-                df["volume_momentum"].iloc[-1] > 0 and  # 거래량 급증 확인
-                df["supertrend"].iloc[-1] < df["trade_price"].iloc[-1]
+            df["rsi"].iloc[-1] < 30 and  # RSI 낮음 (매수 강도 높임)
+            df["macd"].iloc[-1] > df["macd_signal"].iloc[-1] and  # MACD 상향 교차
+            df["adx"].iloc[-1] > 25 and  # ADX 강함
+            df["volume_momentum"].iloc[-1] > 0.05 and  # 거래량 모멘텀 강함
+            df["supertrend"].iloc[-1] < df["trade_price"].iloc[-1] and  # Supertrend 하단에 가격 위치
+            (df["trade_price"].iloc[-1] - df["low_price"].iloc[-1]) / df["low_price"].iloc[-1] < 0.02  # 저점 대비 적은 상승폭
         ):
             send_slack_message(f"[Buy Signal] Market: {market}")
             fee_rate = 0.0005  # 매수 수수료율 (예: 0.05%)
@@ -330,7 +319,6 @@ def track_buy_signals():
                 total_invested += amount_with_fee
                 last_buy_time[market] = time.time()
                 send_slack_message(f"[Buy Completed] Market: {market}, Amount: {amount_with_fee:.2f} KRW")
-
 
 def track_sell_signals():
     """매도 시그널 추적 및 매도 실행"""
@@ -415,8 +403,6 @@ def main():
     send_slack_message("[Start] Automated trading started")
     signal.signal(signal.SIGINT, handle_stop_signal)
     signal.signal(signal.SIGTERM, handle_stop_signal)
-
-    # initialize_buy_prices()
 
     threading.Thread(target=handle_slack_commands, daemon=True).start()
 
