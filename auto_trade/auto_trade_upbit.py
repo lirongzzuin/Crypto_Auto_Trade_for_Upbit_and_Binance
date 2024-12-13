@@ -280,7 +280,22 @@ def get_owned_coins():
 def track_buy_signals():
     """매수 시그널 추적 및 매수 실행"""
     global total_invested
-    balance_krw = get_balance("KRW")
+
+    # 현재 원화 잔고 및 보유 자산 총 평가액 계산
+    balances = upbit.get_balances()
+    balance_krw = 0.0
+    total_asset_value = 0.0
+
+    for balance in balances:
+        if balance['currency'] == 'KRW':
+            balance_krw = float(balance['balance'])
+        else:
+            asset_balance = float(balance['balance'])
+            avg_buy_price = float(balance['avg_buy_price'])
+            total_asset_value += asset_balance * avg_buy_price
+
+    total_asset_value += balance_krw
+
     if balance_krw < MINIMUM_ORDER_KRW:
         return
 
@@ -292,24 +307,26 @@ def track_buy_signals():
         df = calculate_indicators(df)
 
         if (
-            df["rsi"].iloc[-1] < 40 and  # RSI 완화
-            df["macd"].iloc[-1] > 0 and  # MACD 양수
-            df["adx"].iloc[-1] > 20 and  # ADX 완화
-            df["volume_momentum"].iloc[-1] > 0 and  # 거래량 급증 확인
-            df["supertrend"].iloc[-1] < df["trade_price"].iloc[-1]
+                df["rsi"].iloc[-1] < 40 and  # RSI 완화
+                df["macd"].iloc[-1] > 0 and  # MACD 양수
+                df["adx"].iloc[-1] > 20 and  # ADX 완화
+                df["volume_momentum"].iloc[-1] > 0 and  # 거래량 급증 확인
+                df["supertrend"].iloc[-1] < df["trade_price"].iloc[-1]
         ):
             send_slack_message(f"[Buy Signal] Market: {market}")
-            for multiplier in range(1, 6):  # 반복 횟수 조정
-                amount = balance_krw * (buy_ratio * multiplier)
-                if amount < MINIMUM_ORDER_KRW:
-                    continue
-                order = place_market_order("bid", market, price=amount)
-                if order:
-                    buy_prices[market] = df["trade_price"].iloc[-1]
-                    total_invested += amount
-                    last_buy_time[market] = time.time()
-                    send_slack_message(f"[Buy Completed] Market: {market}, Amount: {amount:.2f} KRW")
-                    break
+            amount = total_asset_value * buy_ratio  # 총 자산의 일정 비율로 매수
+            if amount > balance_krw:
+                amount = balance_krw  # 잔여 원화 잔고로 제한
+
+            if amount < MINIMUM_ORDER_KRW:
+                continue
+
+            order = place_market_order("bid", market, price=amount)
+            if order:
+                buy_prices[market] = df["trade_price"].iloc[-1]
+                total_invested += amount
+                last_buy_time[market] = time.time()
+                send_slack_message(f"[Buy Completed] Market: {market}, Amount: {amount:.2f} KRW")
 
 def track_sell_signals():
     """매도 시그널 추적 및 매도 실행"""
