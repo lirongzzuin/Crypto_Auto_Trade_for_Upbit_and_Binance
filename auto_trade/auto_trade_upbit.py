@@ -27,21 +27,39 @@ logger = logging.getLogger()
 buy_prices = {}
 total_profit = 0.0
 total_invested = 0.0
-INTERVAL = 60
-buy_ratio = 0.2
+INTERVAL = 5
+buy_ratio = 0.3
 MINIMUM_ORDER_KRW = 5000
 MINIMUM_VOLUME_THRESHOLD = 0.0001
 MINIMUM_EVALUATION_KRW = 5000  # 최소 평가 금액
 last_buy_time = {}
-COOLDOWN_PERIOD = 60
+COOLDOWN_PERIOD = 5
 last_sell_signal_check = 0
 SELL_SIGNAL_CHECK_INTERVAL = 1800
 stop_trading = threading.Event()  # 프로그램 종료 플래그
+
+# 요청 제한 변수
+REQUEST_LIMIT_PER_SECOND = 10
+REQUEST_COUNT = 0
+LAST_REQUEST_TIME = time.time()
 
 # Upbit 인스턴스
 upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
 
 # ===== Helper Functions =====
+def rate_limit():
+    """API 요청 속도를 제한합니다."""
+    global REQUEST_COUNT, LAST_REQUEST_TIME
+    current_time = time.time()
+    if current_time - LAST_REQUEST_TIME >= 1:
+        REQUEST_COUNT = 0
+        LAST_REQUEST_TIME = current_time
+    REQUEST_COUNT += 1
+    if REQUEST_COUNT > REQUEST_LIMIT_PER_SECOND:
+        sleep_time = 1 - (current_time - LAST_REQUEST_TIME)
+        time.sleep(max(sleep_time, 0))
+
+
 def calculate_rsi(prices, window=14):
     delta = prices.diff(1)
     gain = np.where(delta > 0, delta, 0)
@@ -51,12 +69,14 @@ def calculate_rsi(prices, window=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
+
 def calculate_macd(prices):
     ema12 = prices.ewm(span=12, adjust=False).mean()
     ema26 = prices.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
     macd_signal = macd.ewm(span=9, adjust=False).mean()
     return macd, macd_signal
+
 
 def calculate_adx(df, window=14):
     high = df["high_price"]
@@ -70,6 +90,7 @@ def calculate_adx(df, window=14):
     minus_di = 100 * (pd.Series(minus_dm).rolling(window=window).mean() / atr)
     dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
     return dx.rolling(window=window).mean()
+
 
 def calculate_supertrend(df, atr_period=10, multiplier=3):
     atr = calculate_atr(df, atr_period)
@@ -88,6 +109,7 @@ def calculate_supertrend(df, atr_period=10, multiplier=3):
     df["supertrend"] = df["supertrend"].ffill()
     return df
 
+
 def calculate_atr(df, window):
     high = df["high_price"]
     low = df["low_price"]
@@ -95,9 +117,11 @@ def calculate_atr(df, window):
     tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
     return tr.rolling(window=window).mean()
 
+
 def calculate_volume_momentum(df):
     volume = df["candle_acc_trade_volume"]
     return volume.pct_change().rolling(window=5).mean()
+
 
 def calculate_indicators(df):
     """데이터프레임에 필요한 지표를 추가"""
@@ -108,6 +132,7 @@ def calculate_indicators(df):
     df["volume_momentum"] = calculate_volume_momentum(df)
     return df
 
+
 def calculate_dynamic_thresholds(df):
     atr = calculate_atr(df, 14).iloc[-1]
     return {
@@ -115,21 +140,24 @@ def calculate_dynamic_thresholds(df):
         "take_profit": 0.07 + atr / 100
     }
 
+
 def get_markets():
     url = f"{SERVER_URL}/v1/market/all"
+    rate_limit()
     response = requests.get(url)
     if response.status_code == 200:
         return [market["market"] for market in response.json() if market["market"].startswith("KRW")]
     logger.error(f"Failed to fetch markets: {response.status_code}")
     return []
 
+
 def get_candles_minutes(market, unit=1, count=200, retries=3, delay=10):
     url = f"{SERVER_URL}/v1/candles/minutes/{unit}"
     params = {'market': market, 'count': count}
     for attempt in range(retries):
+        rate_limit()
         response = requests.get(url, params=params)
         if response.status_code == 200:
-            # logger.info(f"{market} on investigating...")
             return response.json()
         elif response.status_code == 429:  # Too Many Requests
             logger.warning(f"Rate limit exceeded for {market}. Retrying after {delay} seconds...")
@@ -140,12 +168,15 @@ def get_candles_minutes(market, unit=1, count=200, retries=3, delay=10):
             break
     return []
 
+
 def send_slack_message(message):
     payload = {"text": message}
     try:
+        rate_limit()
         requests.post(SLACK_WEBHOOK_URL, json=payload)
     except Exception as e:
         logger.error(f"Slack message failed: {e}")
+
 
 def get_order_details(market):
     """주문 완료 정보를 가져옵니다."""
@@ -154,6 +185,7 @@ def get_order_details(market):
     params = {"market": market, "state": "done", "order_by": "desc"}
 
     try:
+        rate_limit()
         response = requests.get(url, headers=headers, params=params)
         if response.status_code == 200:
             return response.json()
@@ -163,15 +195,19 @@ def get_order_details(market):
         logger.error(f"Error fetching order details for {market}: {e}")
     return []
 
+
 def get_balance(ticker):
+    rate_limit()
     balances = upbit.get_balances()
     for b in balances:
         if b["currency"] == ticker:
             return float(b.get("balance", 0))
     return 0.0
 
+
 def place_market_order(side, market, volume=None, price=None):
     try:
+        rate_limit()
         identifier = str(uuid.uuid4())
         if side == "bid":
             order = upbit.buy_market_order(market, price)
@@ -229,6 +265,18 @@ def get_owned_coins():
         if float(b['balance']) > MINIMUM_VOLUME_THRESHOLD and float(b['balance']) * float(b['avg_buy_price']) >= MINIMUM_EVALUATION_KRW
     }
 
+# def initialize_buy_prices():
+#     """보유한 코인의 매수 가격을 초기화합니다."""
+#     owned_coins = get_owned_coins()
+#     for market in owned_coins.keys():
+#         orders = get_order_details(market)
+#         if orders:
+#             for order in orders:
+#                 if order["side"] == "bid" and float(order["executed_volume"]) > 0:
+#                     # 가장 최근 매수 가격을 저장
+#                     buy_prices[market] = float(order["price"])
+#                     break
+
 def track_buy_signals():
     """매수 시그널 추적 및 매수 실행"""
     global total_invested
@@ -276,27 +324,29 @@ def track_sell_signals():
             send_slack_message("[Info] No coins owned. Sell signal tracking is active.")
         last_sell_signal_check = current_time
 
-    for market, volume in get_owned_coins().items():
+    for balance in upbit.get_balances():
+        market = f"KRW-{balance['currency']}"
+        volume = float(balance['balance'])
+        avg_buy_price = float(balance['avg_buy_price'])
+
+        if volume * avg_buy_price < MINIMUM_EVALUATION_KRW:
+            continue  # 최소 평가 금액 이하 자산은 매도하지 않음
+
         candles = get_candles_minutes(market)
         if not candles:
             continue
         df = pd.DataFrame(candles)
         df = calculate_indicators(df)
 
-        buy_price = buy_prices.get(market, 0)
-        if buy_price == 0:
-            continue
-
         current_price = df["trade_price"].iloc[-1]
-        profit_ratio = ((current_price - buy_price) / buy_price) * 100  # 수익률 계산
-        time_since_buy = time.time() - last_buy_time.get(market, 0)
+        profit_ratio = ((current_price - avg_buy_price) / avg_buy_price) * 100  # 수익률 계산
 
-        # 조건 1: 목표 수익률 달성 시 매도
-        if profit_ratio >= 7.0:
+        # 조건 1: 목표 수익률 도달 시 매도
+        if profit_ratio >= 9.0:
             send_slack_message(f"[Sell Signal - Target Profit] Market: {market}, Profit Ratio: {profit_ratio:.2f}%")
             order = place_market_order("ask", market, volume=volume)
             if order:
-                profit = calculate_profit_from_orders(market)
+                profit = (current_price - avg_buy_price) * volume
                 total_profit += profit
                 send_slack_message(
                     f"[Sell Completed] Market: {market}, Profit: {profit:.2f} KRW, Total Profit: {total_profit:.2f} KRW"
@@ -304,11 +354,11 @@ def track_sell_signals():
                 continue
 
         # 조건 2: Trailing Stop 적용
-        if profit_ratio > 2.0 and df["supertrend"].iloc[-1] > df["trade_price"].iloc[-1]:
+        if profit_ratio > 1.5 and df["supertrend"].iloc[-1] > df["trade_price"].iloc[-1]:
             send_slack_message(f"[Sell Signal - Trailing Stop] Market: {market}, Profit Ratio: {profit_ratio:.2f}%")
             order = place_market_order("ask", market, volume=volume)
             if order:
-                profit = calculate_profit_from_orders(market)
+                profit = (current_price - avg_buy_price) * volume
                 total_profit += profit
                 send_slack_message(
                     f"[Sell Completed] Market: {market}, Profit: {profit:.2f} KRW, Total Profit: {total_profit:.2f} KRW"
@@ -316,15 +366,16 @@ def track_sell_signals():
                 continue
 
         # 조건 3: 손실 한계 도달 시 손절
-        if profit_ratio <= -5.0:
+        if profit_ratio <= -3.0:
             send_slack_message(f"[Sell Signal - Stop Loss] Market: {market}, Loss Ratio: {profit_ratio:.2f}%")
             order = place_market_order("ask", market, volume=volume)
             if order:
-                profit = calculate_profit_from_orders(market)
-                total_profit += profit
+                loss = (current_price - avg_buy_price) * volume
+                total_profit += loss
                 send_slack_message(
-                    f"[Sell Completed] Market: {market}, Loss: {profit:.2f} KRW, Total Profit: {total_profit:.2f} KRW"
+                    f"[Sell Completed] Market: {market}, Loss: {loss:.2f} KRW, Total Profit: {total_profit:.2f} KRW"
                 )
+
 
 # ===== Slack 명령 처리 =====
 def handle_slack_commands():
@@ -338,11 +389,13 @@ def handle_slack_commands():
                 os.kill(os.getpid(), signal.SIGTERM)
         time.sleep(5)
 
-# ===== Main Function =====
+# main 함수에서 초기화 호출
 def main():
     send_slack_message("[Start] Automated trading started")
     signal.signal(signal.SIGINT, handle_stop_signal)
     signal.signal(signal.SIGTERM, handle_stop_signal)
+
+    # initialize_buy_prices()
 
     threading.Thread(target=handle_slack_commands, daemon=True).start()
 

@@ -10,10 +10,10 @@ SLACK_WEBHOOK_URL_FOR_ALERT = os.getenv("SLACK_WEBHOOK_URL_FOR_ALERT")
 
 # List of crypto alerts
 crypto_alerts = [
-    {"symbol": "BTCUSDT", "above": 98600, "below": 92580},
-    {"symbol": "ETHUSDT", "above": 3750, "below": 3400},
-    {"symbol": "ADAUSDT", "above": 1.15, "below": 0.85},
-    {"symbol": "SOLUSDT", "above": 240, "below": 199},
+    {"symbol": "BTCUSDT", "above": 104100, "below": 98580},
+    {"symbol": "ETHUSDT", "above": 4100, "below": 3700},
+    {"symbol": "ADAUSDT", "above": 1.2, "below": 1.02},
+    {"symbol": "SOLUSDT", "above": 250, "below": 215},
     # Add more as needed
 ]
 
