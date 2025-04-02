@@ -4,3 +4,4 @@ numpy
 logging
 pyupbit
 python-dotenv
+pytz
