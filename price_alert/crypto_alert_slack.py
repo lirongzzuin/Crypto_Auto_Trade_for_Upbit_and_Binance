@@ -15,9 +15,12 @@ BINANCE_API_URL = "https://api.binance.com/api/v3/ticker/price"
 # Slack Webhook URL
 SLACK_WEBHOOK_URL_FOR_ALERT = os.getenv("SLACK_WEBHOOK_URL_FOR_ALERT")
 
-# 요약 알림 시간 설정 (기본값 8~18시)
+# 요약 알림 시간 설정 (기본값: 8시 ~ 18시)
 SUMMARY_START_HOUR = int(os.getenv("SUMMARY_START_HOUR", 8))
 SUMMARY_END_HOUR = int(os.getenv("SUMMARY_END_HOUR", 18))
+
+# 가격 알림 쿨다운 시간 (초)
+ALERT_COOLDOWN_SECONDS = 300
 
 # 감시할 코인 목록 및 가격 조건
 crypto_alerts = [
@@ -72,15 +75,22 @@ def get_summary_message():
 
 def monitor_prices():
     global running
-    alerted = {alert["symbol"]: {"above": False, "below": False} for alert in crypto_alerts}
-    
+
+    # 알림 상태 관리: 마지막 알림 시각 저장
+    tz = pytz.timezone("Asia/Seoul")
+    alerted = {
+        alert["symbol"]: {
+            "above": {"last_time": None},
+            "below": {"last_time": None}
+        } for alert in crypto_alerts
+    }
+
     # 최초 실행 시 현재 가격 요약 전송
     send_slack_message("📢 코인 가격 모니터링이 시작되었습니다. (알림 상시 + 요약은 설정된 시간대 정시마다)")
     summary_message = get_summary_message()
     send_slack_message(summary_message)
 
     # 다음 정시 계산
-    tz = pytz.timezone("Asia/Seoul")
     now = datetime.now(tz)
     next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
 
@@ -90,26 +100,26 @@ def monitor_prices():
         for alert in crypto_alerts:
             symbol = alert["symbol"]
             current_price = get_crypto_price(symbol)
-
             if current_price is None:
                 continue
 
-            if not alerted[symbol]["above"] and current_price > alert["above"]:
-                send_slack_message(f"🚀 {symbol} 가격이 {alert['above']}을 돌파했습니다! 현재 가격: {current_price}")
-                send_slack_message("🔥 불장 시작?!! 🚀🚀🚀")
-                alerted[symbol]["above"] = True
+            # 상단 돌파 조건
+            if current_price > alert["above"]:
+                last_time = alerted[symbol]["above"]["last_time"]
+                if last_time is None or (now - last_time).total_seconds() >= ALERT_COOLDOWN_SECONDS:
+                    send_slack_message(f"🚀 {symbol} 가격이 {alert['above']}을 돌파했습니다! 현재 가격: {current_price}")
+                    send_slack_message("🔥 불장 시작?!! 🚀🚀🚀")
+                    alerted[symbol]["above"]["last_time"] = now
 
-            if not alerted[symbol]["below"] and current_price < alert["below"]:
-                send_slack_message(f"📉 {symbol} 가격이 {alert['below']} 아래로 떨어졌습니다! 현재 가격: {current_price}")
-                send_slack_message("😭 저점인거죠...? 지금인거죠...? 📉")
-                alerted[symbol]["below"] = True
+            # 하단 이탈 조건
+            if current_price < alert["below"]:
+                last_time = alerted[symbol]["below"]["last_time"]
+                if last_time is None or (now - last_time).total_seconds() >= ALERT_COOLDOWN_SECONDS:
+                    send_slack_message(f"📉 {symbol} 가격이 {alert['below']} 아래로 떨어졌습니다! 현재 가격: {current_price}")
+                    send_slack_message("😭 저점인거죠...? 지금인거죠...? 📉")
+                    alerted[symbol]["below"]["last_time"] = now
 
-            if alerted[symbol]["above"] and current_price <= alert["above"]:
-                alerted[symbol]["above"] = False
-
-            if alerted[symbol]["below"] and current_price >= alert["below"]:
-                alerted[symbol]["below"] = False
-
+        # 정시 요약 메시지
         if now >= next_hour:
             if is_in_summary_time_range():
                 summary_message = get_summary_message()
