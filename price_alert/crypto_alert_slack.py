@@ -2,9 +2,17 @@ import requests
 from time import sleep
 import os
 import signal
+import logging
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import pytz
+
+# 로깅 설정
+logging.basicConfig(
+    filename='crypto_alert.log',
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+)
 
 # .env 파일 로드
 load_dotenv()
@@ -20,17 +28,17 @@ SUMMARY_START_HOUR = int(os.getenv("SUMMARY_START_HOUR", 8))
 SUMMARY_END_HOUR = int(os.getenv("SUMMARY_END_HOUR", 18))
 
 # 가격 알림 쿨다운 시간 (초)
-ALERT_COOLDOWN_SECONDS = 300
+ALERT_COOLDOWN_SECONDS = 1800
 
 # 감시할 코인 목록 및 가격 조건
 crypto_alerts = [
-    {"symbol": "BTCUSDT", "above": 83000, "below": 71000},
-    {"symbol": "ETHUSDT", "above": 1700, "below": 1400},
-    {"symbol": "XRPUSDT", "above": 2.5, "below": 1.6},
-    {"symbol": "SOLUSDT", "above": 120, "below": 98},
-    {"symbol": "ADAUSDT", "above": 0.7, "below": 0.5},
-    {"symbol": "HBARUSDT", "above": 0.2, "below": 0.132},
-    {"symbol": "TRUMPUSDT", "above": 10, "below": 7},
+    {"symbol": "BTCUSDT", "above": 87000, "below": 71000},
+    {"symbol": "ETHUSDT", "above": 1750, "below": 1400},
+    {"symbol": "XRPUSDT", "above": 3, "below": 1.6},
+    {"symbol": "SOLUSDT", "above": 150, "below": 98},
+    {"symbol": "ADAUSDT", "above": 0.8, "below": 0.5},
+    {"symbol": "HBARUSDT", "above": 0.25, "below": 0.132},
+    {"symbol": "TRUMPUSDT", "above": 12, "below": 7},
 ]
 
 running = True
@@ -42,15 +50,16 @@ def get_crypto_price(symbol):
         data = response.json()
         return float(data["price"])
     except requests.exceptions.RequestException as e:
-        print(f"⚠️ {symbol} 가격을 가져오는 중 오류 발생: {e}")
+        logging.error(f"{symbol} 가격을 가져오는 중 오류 발생: {e}")
         return None
 
 def send_slack_message(message):
     try:
         response = requests.post(SLACK_WEBHOOK_URL_FOR_ALERT, json={"text": message})
         response.raise_for_status()
+        logging.info(f"Slack 메시지 전송: {message}")
     except requests.exceptions.RequestException as e:
-        print(f"⚠️ Slack 메시지 전송 실패: {e}")
+        logging.error(f"Slack 메시지 전송 실패: {e}")
 
 def signal_handler(sig, frame):
     global running
@@ -65,32 +74,30 @@ def is_in_summary_time_range():
     return now.weekday() < 5 and SUMMARY_START_HOUR <= now.hour <= SUMMARY_END_HOUR
 
 def get_summary_message():
-    message = "📊 **현재 코인 가격 요약** 📊\n\nhttps://coinmarketcap.com/ko/\n\n"
+    message = "📊 *현재 코인 가격 요약* 📊\n\n🔗 https://coinmarketcap.com/ko/\n\n"
     for alert in crypto_alerts:
         symbol = alert["symbol"]
         price = get_crypto_price(symbol)
         if price is not None:
-            message += f"- {symbol}: {price} USDT\n"
+            message += f"- *{symbol}*: {price} USDT\n"
     return message
 
 def monitor_prices():
     global running
 
-    # 알림 상태 관리: 마지막 알림 시각 저장
     tz = pytz.timezone("Asia/Seoul")
     alerted = {
         alert["symbol"]: {
-            "above": {"last_time": None},
-            "below": {"last_time": None}
+            "above": {"last_time": None, "last_price": None},
+            "below": {"last_time": None, "last_price": None}
         } for alert in crypto_alerts
     }
 
-    # 최초 실행 시 현재 가격 요약 전송
-    send_slack_message("📢 코인 가격 모니터링이 시작되었습니다. (알림 상시 + 요약은 설정된 시간대 정시마다)")
+    # 시작 알림
+    send_slack_message("✅ 코인 가격 모니터링을 시작합니다. (요약: 정시마다 / 알림: 상시)")
     summary_message = get_summary_message()
     send_slack_message(summary_message)
 
-    # 다음 정시 계산
     now = datetime.now(tz)
     next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
 
@@ -103,23 +110,33 @@ def monitor_prices():
             if current_price is None:
                 continue
 
-            # 상단 돌파 조건
+            # 상단 돌파
             if current_price > alert["above"]:
                 last_time = alerted[symbol]["above"]["last_time"]
+                last_price = alerted[symbol]["above"]["last_price"]
                 if last_time is None or (now - last_time).total_seconds() >= ALERT_COOLDOWN_SECONDS:
-                    send_slack_message(f"🚀 {symbol} 가격이 {alert['above']}을 돌파했습니다! 현재 가격: {current_price}")
-                    send_slack_message("🔥 불장 시작?!! 🚀🚀🚀")
+                    send_slack_message(
+                        f"🚀 *{symbol} 상단 돌파!* 현재 가격: {current_price} USDT\n"
+                        f"> 설정 상단: {alert['above']}\n"
+                        f"🔗 https://www.tradingview.com/symbols/{symbol.replace('USDT', '')}USDT/"
+                    )
                     alerted[symbol]["above"]["last_time"] = now
+                    alerted[symbol]["above"]["last_price"] = current_price
 
-            # 하단 이탈 조건
+            # 하단 이탈
             if current_price < alert["below"]:
                 last_time = alerted[symbol]["below"]["last_time"]
+                last_price = alerted[symbol]["below"]["last_price"]
                 if last_time is None or (now - last_time).total_seconds() >= ALERT_COOLDOWN_SECONDS:
-                    send_slack_message(f"📉 {symbol} 가격이 {alert['below']} 아래로 떨어졌습니다! 현재 가격: {current_price}")
-                    send_slack_message("😭 저점인거죠...? 지금인거죠...? 📉")
+                    send_slack_message(
+                        f"📉 *{symbol} 하단 이탈!* 현재 가격: {current_price} USDT\n"
+                        f"> 설정 하단: {alert['below']}\n"
+                        f"🔗 https://www.tradingview.com/symbols/{symbol.replace('USDT', '')}USDT/"
+                    )
                     alerted[symbol]["below"]["last_time"] = now
+                    alerted[symbol]["below"]["last_price"] = current_price
 
-        # 정시 요약 메시지
+        # 정시 요약
         if now >= next_hour:
             if is_in_summary_time_range():
                 summary_message = get_summary_message()
