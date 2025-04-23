@@ -53,15 +53,17 @@ def get_crypto_price(symbol):
         logging.error(f"{symbol} 가격 조회 실패: {e}")
         return None
 
-def get_upbit_price(symbol):
-    try:
-        symbol_krw = "KRW-" + symbol.replace("USDT", "")
-        response = requests.get(UPBIT_API_URL, params={"markets": symbol_krw})
-        response.raise_for_status()
-        return float(response.json()[0]["trade_price"])
-    except Exception as e:
-        logging.warning(f"{symbol_krw} 원화 가격 조회 실패: {e}")
-        return None
+def get_upbit_price(symbol, retries=3, delay=1):
+    symbol_krw = "KRW-" + symbol.replace("USDT", "")
+    for attempt in range(retries):
+        try:
+            response = requests.get(UPBIT_API_URL, params={"markets": symbol_krw}, timeout=2)
+            response.raise_for_status()
+            return float(response.json()[0]["trade_price"])
+        except Exception as e:
+            logging.warning(f"[{symbol_krw}] 원화 가격 조회 실패 (시도 {attempt+1}/{retries}): {e}")
+            sleep(delay)
+    return None
 
 def send_slack_message(message):
     try:
@@ -89,6 +91,8 @@ def get_all_prices():
         symbol = alert["symbol"]
         binance_price = get_crypto_price(symbol)
         upbit_price = get_upbit_price(symbol)
+        if upbit_price is None:
+            logging.warning(f"{symbol}의 업비트 원화 가격이 None입니다 (슬랙 메시지에서 누락될 수 있음)")
         prices[symbol] = {
             "usdt": binance_price,
             "krw": upbit_price
