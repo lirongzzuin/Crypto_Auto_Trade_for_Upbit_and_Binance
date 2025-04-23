@@ -83,16 +83,27 @@ def is_in_summary_time_range():
     now = datetime.now(pytz.timezone("Asia/Seoul"))
     return now.weekday() < 5 and SUMMARY_START_HOUR <= now.hour <= SUMMARY_END_HOUR
 
-def get_summary_message():
-    message = "📊 *현재 코인 가격 요약 (Binance / Upbit)* 📊\n\n🔗 https://coinmarketcap.com/ko/\n\n"
+def get_all_prices():
+    prices = {}
     for alert in crypto_alerts:
         symbol = alert["symbol"]
-        price_usdt = get_crypto_price(symbol)
-        price_krw = get_upbit_price(symbol)
-        if price_usdt is not None:
-            message += f"- *{symbol}*: {price_usdt} USDT"
-            if price_krw is not None:
-                message += f" / {int(price_krw):,} KRW"
+        binance_price = get_crypto_price(symbol)
+        upbit_price = get_upbit_price(symbol)
+        prices[symbol] = {
+            "usdt": binance_price,
+            "krw": upbit_price
+        }
+    return prices
+
+def get_summary_message(all_prices):
+    message = "📊 *현재 코인 가격 요약 (Binance / Upbit)* 📊\n\n🔗 https://coinmarketcap.com/ko/\n\n"
+    for symbol, data in all_prices.items():
+        usdt = data["usdt"]
+        krw = data["krw"]
+        if usdt is not None:
+            message += f"- *{symbol}*: {usdt} USDT"
+            if krw is not None:
+                message += f" / {int(krw):,} KRW"
             message += "\n"
     return message
 
@@ -108,7 +119,8 @@ def monitor_prices():
     }
 
     send_slack_message("✅ 코인 가격 모니터링을 시작합니다. (요약: 정시마다 / 알림: 상시)")
-    send_slack_message(get_summary_message())
+    all_prices = get_all_prices()
+    send_slack_message(get_summary_message(all_prices))
 
     now = datetime.now(tz)
     next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
@@ -156,7 +168,8 @@ def monitor_prices():
 
         if now >= next_hour:
             if is_in_summary_time_range():
-                send_slack_message(get_summary_message())
+                all_prices = get_all_prices()
+                send_slack_message(get_summary_message(all_prices))
             next_hour += timedelta(hours=1)
 
         sleep(10)
