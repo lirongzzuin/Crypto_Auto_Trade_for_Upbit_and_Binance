@@ -1,6 +1,7 @@
 import time
 import requests
 import pandas as pd
+pd.set_option('future.no_silent_downcasting', True)
 import numpy as np
 import logging
 import signal
@@ -216,9 +217,18 @@ def get_candles_minutes_multiple(market, units=[1, 60, 240]):
     for unit in units:
         df = pyupbit.get_ohlcv(market, interval=f"{unit}m")
         if df is not None and not df.empty:
+            # 컬럼명 변경
+            df = df.rename(columns={
+                'close': 'trade_price',
+                'high': 'high_price',
+                'low': 'low_price',
+                'open': 'open_price',
+                'volume': 'candle_acc_trade_volume'
+            })
             df = calculate_indicators(df)
             result[unit] = df
     return result
+
 
 # --- 지표 계산 함수 ---
 def calculate_rsi(prices, window=14):
@@ -282,6 +292,7 @@ def calculate_supertrend(df, atr_period=10, multiplier=3):
     if len(df) < atr_period:
         df["supertrend"] = False
         return df
+
     hl2 = (df["high_price"] + df["low_price"]) / 2
     tr = pd.concat([
         df["high_price"] - df["low_price"],
@@ -291,14 +302,16 @@ def calculate_supertrend(df, atr_period=10, multiplier=3):
     atr = tr.rolling(window=atr_period).mean()
     upperband = hl2 + (multiplier * atr)
     lowerband = hl2 - (multiplier * atr)
+
     supertrend_values = [False] * len(df)
     for i in range(1, len(df)):
-        if df["trade_price"][i] > upperband[i - 1]:
+        if df["trade_price"].iloc[i] > upperband.iloc[i - 1]:
             supertrend_values[i] = True
-        elif df["trade_price"][i] < lowerband[i - 1]:
+        elif df["trade_price"].iloc[i] < lowerband.iloc[i - 1]:
             supertrend_values[i] = False
         else:
             supertrend_values[i] = supertrend_values[i - 1]
+
     df["supertrend"] = supertrend_values
     return df
 
@@ -394,7 +407,7 @@ def detect_market_structure_shift(df):
             df.loc[i, 'mss_bearish'] = True
     return df
 
-def calculate_indicators(df):
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["rsi"] = calculate_rsi(df["trade_price"])
     macd_line, macd_signal = calculate_macd(df["trade_price"])
     df["macd"] = macd_line
@@ -418,12 +431,12 @@ def calculate_indicators(df):
         if col not in df.columns:
             df[col] = np.nan
 
-    df.fillna(method="ffill", inplace=True)
+    df.ffill(inplace=True)
+    df.infer_objects(copy=False)
     return df
 
 # --- 트레이딩 로직 ---
 def initialize_trading_data():
-    """프로그램 시작 시 거래 관련 데이터를 초기화합니다."""
     global buy_prices, total_profit, total_invested, last_buy_time, highest_prices
     send_slack_message("[Info] Initializing trading data...")
 
@@ -433,11 +446,17 @@ def initialize_trading_data():
     last_buy_time = {}
     highest_prices = {}
 
+    valid_markets = set(pyupbit.get_tickers(fiat="KRW"))
+
     try:
         balances = upbit.get_balances()
         for balance in balances:
             if balance['currency'] != 'KRW' and float(balance['balance']) > 0:
                 market_code = f"KRW-{balance['currency']}"
+                if market_code not in valid_markets:
+                    logger.warning(f"[Skip] {market_code} - 마켓 코드 유효하지 않음 (상장폐지 등)")
+                    continue
+
                 avg_price = float(balance.get('avg_buy_price', 0))
                 current_price = pyupbit.get_current_price(market_code)
 
