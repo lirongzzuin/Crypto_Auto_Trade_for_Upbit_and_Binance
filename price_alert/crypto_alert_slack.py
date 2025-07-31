@@ -29,17 +29,15 @@ SUMMARY_START_HOUR = int(os.getenv("SUMMARY_START_HOUR", 8))
 SUMMARY_END_HOUR = int(os.getenv("SUMMARY_END_HOUR", 18))
 
 # 가격 알림 쿨다운 시간 (초)
-ALERT_COOLDOWN_SECONDS = 3600
+ALERT_COOLDOWN_SECONDS = 7200
 
 # 감시할 코인 목록 및 가격 조건
 crypto_alerts = [
-    {"symbol": "BTCUSDT", "above": 97000, "below": 87000},
-    {"symbol": "ETHUSDT", "above": 1850, "below": 1600},
-    {"symbol": "XRPUSDT", "above": 3, "below": 2},
-    {"symbol": "SOLUSDT", "above": 155, "below": 130},
-    {"symbol": "ADAUSDT", "above": 0.9, "below": 0.6},
-    {"symbol": "HBARUSDT", "above": 0.3, "below": 0.15},
-    {"symbol": "TRUMPUSDT", "above": 12, "below": 8},
+    {"symbol": "BTCUSDT", "above": 125000, "below": 95000},
+    {"symbol": "ETHUSDT", "above": 5000, "below": 3000},
+    {"symbol": "XRPUSDT", "above": 5, "below": 2},
+    {"symbol": "SOLUSDT", "above": 230, "below": 150},
+    {"symbol": "ADAUSDT", "above": 1, "below": 0.5}
 ]
 
 running = True
@@ -111,6 +109,25 @@ def get_summary_message(all_prices):
             message += "\n"
     return message
 
+def get_next_summary_time(now):
+    # 9시부터 시작해서 4시간 간격의 시간대
+    base_hour = 9
+    hour_list = [(base_hour + 4 * i) % 24 for i in range(6)]  # [9, 13, 17, 21, 1, 5]
+
+    today = now.replace(minute=0, second=0, microsecond=0)
+    candidate_times = []
+
+    for h in hour_list:
+        candidate_time = today.replace(hour=h)
+        if h < now.hour:
+            # 시각이 지났으면 다음 날로 이월
+            candidate_time += timedelta(days=1 if h <= 5 else 0)
+        candidate_times.append(candidate_time)
+
+    # 가장 가까운 미래의 시간 반환
+    next_time = min([t for t in candidate_times if t > now])
+    return next_time
+
 def monitor_prices():
     global running
 
@@ -122,12 +139,12 @@ def monitor_prices():
         } for alert in crypto_alerts
     }
 
-    send_slack_message("✅ 코인 가격 모니터링을 시작합니다. (요약: 정시마다 / 알림: 상시)")
+    send_slack_message("✅ 코인 가격 모니터링을 시작합니다. (요약: 4시간 간격 / 알림: 상시)")
     all_prices = get_all_prices()
     send_slack_message(get_summary_message(all_prices))
 
     now = datetime.now(tz)
-    next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    next_summary_time = get_next_summary_time(now)
 
     while running:
         now = datetime.now(tz)
@@ -170,11 +187,11 @@ def monitor_prices():
                     send_slack_message(msg)
                     alerted[symbol]["below"]["last_time"] = now
 
-        if now >= next_hour:
+        if now >= next_summary_time:
             if is_in_summary_time_range():
                 all_prices = get_all_prices()
                 send_slack_message(get_summary_message(all_prices))
-            next_hour += timedelta(hours=1)
+            next_summary_time += timedelta(hours=4)
 
         sleep(10)
 
