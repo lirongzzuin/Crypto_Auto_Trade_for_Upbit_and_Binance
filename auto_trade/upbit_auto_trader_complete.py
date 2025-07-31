@@ -122,29 +122,36 @@ def place_market_order(side, market, volume=None, price=None):
         rate_limit()
         identifier = str(uuid.uuid4())
         order_result = None
+
         if side == "bid":
+            if price is None or price < MINIMUM_ORDER_KRW:
+                logger.warning(f"[Buy Skipped] {market} 주문 금액 부족: {price}")
+                return None
             order_result = upbit.buy_market_order(market, price)
             if order_result:
-                send_slack_message(f"[Buy Order] Market: {market}, Amount: {price:.2f} KRW, ID: {identifier}")
+                send_slack_message(f"[Buy Order] {market} 매수 {price:.2f} KRW | UUID: {identifier}")
+
         elif side == "ask":
+            if volume is None or volume * pyupbit.get_current_price(market) < MINIMUM_ORDER_KRW:
+                logger.warning(f"[Sell Skipped] {market} 주문 수량 부족: {volume}")
+                return None
             order_result = upbit.sell_market_order(market, volume)
             if order_result:
-                send_slack_message(f"[Sell Order] Market: {market}, Volume: {volume:.4f} units, ID: {identifier}")
-        
-        # 주문 결과 확인 및 UUID 반환 (업비트 API 응답 구조에 따라 유연하게 처리)
+                send_slack_message(f"[Sell Order] {market} 매도 {volume:.4f}개 | UUID: {identifier}")
+
         if order_result and 'uuid' in order_result:
             return order_result
-        elif order_result and 'error' not in order_result: # 성공했으나 uuid가 없는 경우 (체결 완료)
-             return {'uuid': 'immediate_execution', 'state': 'done', **order_result} # 임시 UUID 및 상태 추가
+        elif order_result and 'error' not in order_result:
+            return {'uuid': 'immediate_execution', 'state': 'done', **order_result}
         else:
             logger.error(f"Failed to place {side} order for {market}: {order_result}")
-            send_slack_message(f"[Error] Failed to place {side} order for {market}: {order_result}")
+            send_slack_message(f"[Error] 주문 실패: {side} {market}: {order_result}")
             return None
 
     except Exception as e:
-        logger.error(f"Failed to place {side} order for {market}: {e}")
-        send_slack_message(f"[Error] Failed to place {side} order for {market}: {e}")
-    return None
+        logger.error(f"Exception placing {side} order for {market}: {e}")
+        send_slack_message(f"[Error] Exception during order: {side} {market}: {e}")
+        return None
 
 def get_order(uuid_or_market, state='done'):
     """현재 완료된 주문 정보를 가져오는 함수 (Upbit API Wrapper 사용)"""
@@ -155,17 +162,24 @@ def get_order(uuid_or_market, state='done'):
         return result
     except Exception as e:
         logger.error(f"Error fetching order {uuid_or_market}: {e}")
+        send_slack_message(f"[Order Check Fail] UUID: {uuid_or_market} 에 대한 체결 확인 실패")
         return None
 
 # --- 데이터 로드 함수 ---
 def get_markets():
+    """업비트의 모든 KRW 마켓 리스트를 반환"""
     url = f"{SERVER_URL}/v1/market/all"
-    rate_limit()
-    response = requests.get(url)
-    if response.status_code == 200:
-        return [market["market"] for market in response.json() if market["market"].startswith("KRW")]
-    logger.error(f"Failed to fetch markets: {response.status_code}")
-    return []
+    try:
+        rate_limit()
+        response = requests.get(url)
+        if response.status_code == 200:
+            return [market["market"] for market in response.json() if market["market"].startswith("KRW")]
+        else:
+            logger.error(f"Failed to fetch markets: status_code={response.status_code}")
+            return []
+    except Exception as e:
+        logger.error(f"Exception while fetching markets: {e}")
+        return []
 
 def get_candles_minutes(market, unit=1, count=200, retries=3, delay=10):
     url = f"{SERVER_URL}/v1/candles/minutes/{unit}"
@@ -197,15 +211,14 @@ def get_candles_minutes(market, unit=1, count=200, retries=3, delay=10):
             break
     return pd.DataFrame()
 
-def get_candles_minutes_multiple(market, units=[1, 60, 240], count=200):
-    all_dfs = {}
+def get_candles_minutes_multiple(market, units=[1, 60, 240]):
+    result = {}
     for unit in units:
-        df = get_candles_minutes(market, unit=unit, count=count)
-        if not df.empty:
-            all_dfs[unit] = calculate_indicators(df)
-        else:
-            all_dfs[unit] = pd.DataFrame()
-    return all_dfs
+        df = pyupbit.get_ohlcv(market, interval=f"{unit}m")
+        if df is not None and not df.empty:
+            df = calculate_indicators(df)
+            result[unit] = df
+    return result
 
 # --- 지표 계산 함수 ---
 def calculate_rsi(prices, window=14):
@@ -382,45 +395,57 @@ def detect_market_structure_shift(df):
     return df
 
 def calculate_indicators(df):
-    """모든 지표를 계산하여 DataFrame에 추가합니다."""
-    if df.empty or 'trade_price' not in df.columns or df['trade_price'].isnull().all():
-        logger.warning("Trade price column missing or all null in dataframe, skipping indicator calculation.")
-        return df.copy() # 빈 df 또는 문제 있는 df는 복사본 반환
-
     df["rsi"] = calculate_rsi(df["trade_price"])
-    df["macd"], df["macd_signal"] = calculate_macd(df["trade_price"])
+    macd_line, macd_signal = calculate_macd(df["trade_price"])
+    df["macd"] = macd_line
+    df["macd_signal"] = macd_signal
     df["adx"] = calculate_adx(df)
-    df = calculate_obv(df.copy()) # OBV는 DF 수정하므로 복사본 전달
-    df = detect_fvg(df.copy()) # FVG도 DF 수정하므로 복사본 전달
-    df = calculate_supertrend(df.copy()) # Supertrend도 DF 수정하므로 복사본 전달
-    df["volume_momentum"] = calculate_volume_momentum(df)
+    df = calculate_supertrend(df)
+    df = detect_order_block(df)
+    df = detect_fvg(df)
+    df = detect_liquidity_sweep(df)
+    df = detect_market_structure_shift(df)
     df["atr"] = calculate_atr(df)
 
-    # ICT 지표
-    df = detect_order_block(df.copy())
-    df = detect_liquidity_sweep(df.copy())
-    df = detect_market_structure_shift(df.copy())
+    # 누락된 컬럼 강제 삽입
+    required_cols = [
+        "rsi", "macd", "macd_signal", "adx", "supertrend",
+        "bullish_ob", "bearish_ob", "fvg",
+        "liquidity_sweep_down", "liquidity_sweep_up",
+        "mss_bullish", "mss_bearish", "atr"
+    ]
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = np.nan
 
+    df.fillna(method="ffill", inplace=True)
     return df
 
 # --- 트레이딩 로직 ---
 def initialize_trading_data():
     """프로그램 시작 시 거래 관련 데이터를 초기화합니다."""
-    global buy_prices, total_profit, total_invested, last_buy_time
+    global buy_prices, total_profit, total_invested, last_buy_time, highest_prices
     send_slack_message("[Info] Initializing trading data...")
+
     buy_prices = {}
     total_profit = 0.0
     total_invested = 0.0
     last_buy_time = {}
+    highest_prices = {}
 
     try:
         balances = upbit.get_balances()
         for balance in balances:
             if balance['currency'] != 'KRW' and float(balance['balance']) > 0:
                 market_code = f"KRW-{balance['currency']}"
-                # Upbit API에서 제공하는 avg_buy_price 활용
-                buy_prices[market_code] = float(balance.get('avg_buy_price', 0))
-                send_slack_message(f"[Info] Initialized {market_code} with avg buy price: {buy_prices[market_code]:.2f} (from Upbit balances)")
+                avg_price = float(balance.get('avg_buy_price', 0))
+                current_price = pyupbit.get_current_price(market_code)
+
+                buy_prices[market_code] = avg_price
+                if current_price:
+                    highest_prices[market_code] = current_price
+
+                send_slack_message(f"[Info] Initialized {market_code} | 평균단가: {avg_price:.2f} | 현재가: {current_price:.2f}")
     except Exception as e:
         logger.error(f"Failed to initialize buy prices from balances: {e}")
         send_slack_message(f"[Error] Failed to initialize buy prices: {e}")
@@ -430,10 +455,11 @@ def update_highest_price():
     for b in balances:
         if b["currency"] == "KRW": continue
         market = f"KRW-{b['currency']}"
+        rate_limit()
         current_price = pyupbit.get_current_price(market)
         prev_high = float(b.get("highest_price", 0))
         if current_price > prev_high:
-            b["highest_price"] = current_price  # dict로 유지 필요 (실제로는 DB 또는 파일 저장 권장)
+            highest_prices[market] = current_price  # dict로 유지 필요 (실제로는 DB 또는 파일 저장 권장)
 
 def generate_daily_report():
     try:
@@ -489,8 +515,7 @@ def start_report_thread():
     threading.Thread(target=report_loop, daemon=True).start()
 
 def track_buy_signals():
-    """매수 시그널 추적 및 매수 실행"""
-    global total_invested, last_buy_time
+    global total_invested, last_buy_time, buy_prices
 
     balances = upbit.get_balances()
     balance_krw = 0.0
@@ -510,12 +535,18 @@ def track_buy_signals():
     total_asset_value += balance_krw
 
     if len(owned_currencies) >= MAX_CONCURRENT_TRADES:
-        # logger.info(f"Max concurrent trades ({MAX_CONCURRENT_TRADES}) reached. Skipping buy signals.")
+        logger.info(f"[Skip] 보유 종목이 {MAX_CONCURRENT_TRADES}개 이상입니다.")
         return
 
     if balance_krw < MINIMUM_ORDER_KRW:
-        logger.warning(f"잔액 부족: {balance_krw:.2f} KRW. 최소 주문 금액: {MINIMUM_ORDER_KRW:.2f} KRW")
+        logger.info(f"[Skip] 사용 가능한 잔액 부족: {balance_krw:.2f} KRW")
         return
+
+    def safe_get(series, index=-1):
+        try:
+            return series.iloc[index]
+        except:
+            return np.nan
 
     for market in get_markets():
         if market in last_buy_time and (time.time() - last_buy_time[market] < COOLDOWN_PERIOD_BUY):
@@ -526,135 +557,106 @@ def track_buy_signals():
         df_60m = multi_timeframe_dfs.get(60)
         df_240m = multi_timeframe_dfs.get(240)
 
-        if df_1m.empty or df_60m.empty or df_240m.empty:
-            # logger.warning(f"Failed to get sufficient candle data for {market}. Skipping buy.")
+        if df_1m is None or df_1m.empty or df_1m.isnull().values.any():
+            continue
+        if df_60m is None or df_240m is None:
             continue
 
+        for df in [df_1m, df_60m, df_240m]:
+            df.fillna(method="ffill", inplace=True)
+            for col in ["rsi", "macd", "macd_signal", "adx", "supertrend", "bullish_ob", "fvg", "liquidity_sweep_down", "atr"]:
+                if col not in df.columns:
+                    df[col] = np.nan
+
         current_price = df_1m["trade_price"].iloc[-1]
-
-        existing_volume, _ = get_balance(market.replace("KRW-", ""))
+        existing_volume, existing_avg = get_balance(market.replace("KRW-", ""))
         max_invested_per_coin = total_asset_value * 0.10
-
         if existing_volume * current_price >= max_invested_per_coin:
             continue
 
-        # NaN 값이 있으면 분석 불가하므로 스킵
-        if df_1m.isnull().values.any() or df_60m.isnull().values.any() or df_240m.isnull().values.any():
-            logger.warning(f"NaN values detected in indicators for {market}. Skipping buy.")
+        is_bullish_trend_60m = safe_get(df_60m["supertrend"]) and safe_get(df_60m["macd"]) > safe_get(df_60m["macd_signal"])
+        is_bullish_trend_240m = safe_get(df_240m["supertrend"]) and safe_get(df_240m["macd"]) > safe_get(df_240m["macd_signal"])
+        if not (is_bullish_trend_60m and is_bullish_trend_240m):
             continue
 
-        # --- 멀티 타임프레임 추세 확인 (상위 시간봉) ---
-        # 240분봉과 60분봉이 상승 추세 (Supertrend True, MACD 골든크로스)
-        is_bullish_trend_60m = df_60m["supertrend"].iloc[-1] and \
-                                (df_60m["macd"].iloc[-1] > df_60m["macd_signal"].iloc[-1])
-        is_bullish_trend_240m = df_240m["supertrend"].iloc[-1] and \
-                                 (df_240m["macd"].iloc[-1] > df_240m["macd_signal"].iloc[-1])
+        rsi = safe_get(df_1m["rsi"])
+        macd = safe_get(df_1m["macd"])
+        macd_signal = safe_get(df_1m["macd_signal"])
+        adx = safe_get(df_1m["adx"])
+        supertrend_1m = safe_get(df_1m["supertrend"])
+        bullish_ob = safe_get(df_1m["bullish_ob"])
+        fvg = safe_get(df_1m["fvg"])
+        liquidity_sweep_down = safe_get(df_1m["liquidity_sweep_down"])
+        prev_macd = safe_get(df_1m["macd"], -2)
+        prev_signal = safe_get(df_1m["macd_signal"], -2)
+        macd_crossover = pd.notna(prev_macd) and pd.notna(prev_signal) and macd > macd_signal and prev_macd <= prev_signal
 
-        if not (is_bullish_trend_60m and is_bullish_trend_240m):
-            continue # 상위 시간봉 추세가 상승이 아니면 매수하지 않음
-
-        # --- ICT 기반 매수 조건 (하위 시간봉 - 1분봉) ---
-        rsi = df_1m["rsi"].iloc[-1]
-        macd = df_1m["macd"].iloc[-1]
-        macd_signal = df_1m["macd_signal"].iloc[-1]
-        adx = df_1m["adx"].iloc[-1]
-        fvg = df_1m["fvg"].iloc[-1]
-        volume_momentum = df_1m["volume_momentum"].iloc[-1]
-        supertrend_1m = df_1m["supertrend"].iloc[-1]
-        bullish_ob = df_1m['bullish_ob'].iloc[-1]
-        liquidity_sweep_down = df_1m['liquidity_sweep_down'].iloc[-1]
-        mss_bullish = df_1m['mss_bullish'].iloc[-1]
-
-        # 복합적인 매수 조건: ICT 개념을 더 강하게 적용
         buy_condition_met = (
+            pd.notna(rsi) and rsi < 40 and
+            pd.notna(adx) and adx > 17 and
             supertrend_1m and
-            (macd > macd_signal and df_1m["macd"].iloc[-2] <= df_1m["macd_signal"].iloc[-2]) and
-            adx > 17 and
-            volume_momentum > -0.01 and
-            (bullish_ob or fvg or liquidity_sweep_down) and  # and → or
-            rsi < 40
+            pd.notna(macd) and pd.notna(macd_signal) and
+            macd_crossover and
+            (bullish_ob or fvg or liquidity_sweep_down)
         )
 
+        if not buy_condition_met:
+            continue
 
-        if buy_condition_met:
-            send_slack_message(f"[Buy Signal Detected] Market: {market}, Price: {current_price:.2f}")
+        send_slack_message(f"[Buy Signal Detected] {market} - 조건 충족. 현재가: {current_price:.2f} KRW")
 
-            # 동적 매수 금액 결정: 자산의 일정 비율 + 변동성 고려
-            current_atr = df_1m['atr'].iloc[-1]
-            if not np.isnan(current_atr) and current_atr > 0:
-                # ATR이 높을수록 변동성이 크므로, 보수적으로 매수 비중 조절
-                # (예: ATR이 높을수록 BUY_RATIO_PER_ASSET를 낮춤. 이 로직은 실제 투자 전략에 따라 커스텀 필요)
-                # 여기서는 ATR이 높을수록 매수 비중을 살짝 줄이는 예시
-                atr_normalized = min(current_atr / current_price, 0.05) # 최대 5%까지 정규화
-                adjusted_buy_ratio = BUY_RATIO_PER_ASSET * (1 - atr_normalized * 2) # ATR에 비례하여 비율 감소
-                if adjusted_buy_ratio < BUY_RATIO_PER_ASSET * 0.5: # 최소 비율 제한
-                    adjusted_buy_ratio = BUY_RATIO_PER_ASSET * 0.5
-            else:
-                adjusted_buy_ratio = BUY_RATIO_PER_ASSET
+        current_atr = safe_get(df_1m["atr"])
+        if not np.isnan(current_atr) and current_atr > 0:
+            atr_normalized = min(current_atr / current_price, 0.05)
+            adjusted_buy_ratio = BUY_RATIO_PER_ASSET * (1 - atr_normalized * 2)
+            adjusted_buy_ratio = max(adjusted_buy_ratio, BUY_RATIO_PER_ASSET * 0.5)
+        else:
+            adjusted_buy_ratio = BUY_RATIO_PER_ASSET
 
-            amount = total_asset_value * adjusted_buy_ratio
-            if amount > balance_krw:
-                amount = balance_krw
+        amount = total_asset_value * adjusted_buy_ratio
+        balance_krw, _ = get_balance("KRW")
+        amount = min(amount, balance_krw)
 
-            if amount < MINIMUM_ORDER_KRW:
-                send_slack_message(f"매수 금액 부족: {amount:.2f} KRW. 최소 주문 금액: {MINIMUM_ORDER_KRW:.2f} KRW for {market}")
-                continue
+        if amount < MINIMUM_ORDER_KRW:
+            send_slack_message(f"[Skip] {market} 매수 금액 부족: {amount:.2f} KRW")
+            continue
 
-            # 매수 주문 실행
-            try:
-                order = place_market_order("bid", market, price=amount)
-                if order:
-                    # 주문 UUID를 사용하여 체결 확인 (비동기 처리)
-                    order_uuid = order.get('uuid')
-                    if order_uuid == 'immediate_execution': # 즉시 체결된 경우 (가상의 UUID)
-                        actual_executed_volume = float(order.get('executed_volume', 0))
-                        actual_executed_price = float(order.get('price', current_price))
-                        if actual_executed_volume > 0:
-                            total_invested += amount # 매수 금액 가산
-                            last_buy_time[market] = time.time()
-                            send_slack_message(f"[Buy Completed] Market: {market}, Amount: {amount:.2f} KRW (Est.). Immediate confirmation.")
-                            # Upbit API에서 가져온 평균 매수 단가로 buy_prices 갱신 (또는 get_balances로 갱신)
-                            # initialize_trading_data() # 전체 초기화는 비효율적, 특정 코인만 갱신 필요
-                            balance, avg_price = get_balance(market.replace("KRW-", ""))
-                            if balance > 0 and avg_price > 0:
-                                buy_prices[market] = avg_price
-                            else:
-                                buy_prices[market] = current_price # 임시 저장
-                        else:
-                             send_slack_message(f"[Buy Failed] {market} - Order executed but 0 volume. Review Upbit logs.")
-                    else: # UUID가 있는 경우
-                        # 별도 쓰레드나 루프에서 주문 상태를 지속적으로 확인하는 로직 필요
-                        # 현재는 간단히 몇 초 대기 후 확인
-                        time.sleep(5) # 주문 체결 대기
-                        order_info = get_order(order_uuid)
-                        if order_info and order_info['state'] == 'done' and float(order_info['executed_volume']) > 0:
-                            executed_price = float(order_info.get('price', current_price)) # 체결 평균 단가
-                            executed_volume = float(order_info['executed_volume'])
-                            fee = float(order_info.get('paid_fee', 0))
-                            
-                            total_invested_for_this_order = executed_price * executed_volume + fee # 실제 투자 금액
-                            total_invested += total_invested_for_this_order
-
-                            # 평균 매수 단가 업데이트 (기존 buy_prices와 신규 매수 합산)
-                            existing_volume, existing_avg_price = get_balance(market.replace("KRW-", ""))
-                            if existing_volume > 0 and existing_avg_price > 0:
-                                # (기존 매수 총액 + 신규 매수 총액) / (기존 수량 + 신규 수량)
-                                new_avg_buy_price = ((existing_avg_price * (existing_volume - executed_volume)) + (executed_price * executed_volume)) / existing_volume
-                            else:
-                                new_avg_buy_price = executed_price
-                            buy_prices[market] = new_avg_buy_price
-
-                            last_buy_time[market] = time.time()
-                            send_slack_message(f"[Buy Completed] Market: {market}, Amount: {amount:.2f} KRW, Avg Buy Price: {new_avg_buy_price:.2f}")
-                        else:
-                            send_slack_message(f"[Buy Order Status] {market} - Order {order_uuid} still processing or failed: {order_info}")
-                            logger.warning(f"Buy order {order_uuid} for {market} not confirmed 'done'. Status: {order_info}")
+        try:
+            order = place_market_order("bid", market, price=amount)
+            if order:
+                order_uuid = order.get('uuid')
+                if order_uuid == 'immediate_execution':
+                    executed_volume = float(order.get('executed_volume', 0))
+                    executed_price = float(order.get('price', current_price))
+                    if executed_volume > 0:
+                        total_invested += executed_price * executed_volume
+                        last_buy_time[market] = time.time()
+                        send_slack_message(f"[Buy Completed] {market} 즉시 체결됨. 수량: {executed_volume:.4f}, 단가: {executed_price:.2f}")
+                        _, avg_price = get_balance(market.replace("KRW-", ""))
+                        buy_prices[market] = avg_price if avg_price > 0 else executed_price
                 else:
-                    send_slack_message(f"[Error] Failed to place buy order for {market}: Order object was None.")
+                    time.sleep(5)
+                    order_info = get_order(order_uuid)
+                    if order_info and order_info['state'] == 'done' and float(order_info['executed_volume']) > 0:
+                        executed_price = float(order_info.get('price', current_price))
+                        executed_volume = float(order_info['executed_volume'])
+                        fee = float(order_info.get('paid_fee', 0))
+                        total_invested += executed_price * executed_volume + fee
 
-            except Exception as e:
-                logger.error(f"매수 실패: {e} for {market}")
-                send_slack_message(f"[Error] 매수 실패: {e} for {market}")
+                        _, existing_avg = get_balance(market.replace("KRW-", ""))
+                        if existing_volume > 0 and existing_avg > 0:
+                            new_avg = ((existing_avg * existing_volume) + (executed_price * executed_volume)) / (existing_volume + executed_volume)
+                        else:
+                            new_avg = executed_price
+                        buy_prices[market] = new_avg
+                        last_buy_time[market] = time.time()
+                        send_slack_message(f"[Buy Completed] {market} 체결 완료. 수량: {executed_volume:.4f}, 평균 단가: {new_avg:.2f}")
+                    else:
+                        send_slack_message(f"[Order Failed] {market} - 주문 실패 또는 미체결 상태: {order_info}")
+                        last_buy_time[market] = time.time()
+        except Exception as e:
+            logger.error(f"[Error] 매수 실패 ({market}): {e}")
+            send_slack_message(f"[Error] 매수 실패: {e} for {market}")
 
 # 전역 변수 선언 (코드 상단에 추가)
 highest_prices = {}  # 각 코인별 최고가 저장용
@@ -699,14 +701,13 @@ def track_sell_signals():
         df_1m = multi_timeframe_dfs.get(1)
         df_60m = multi_timeframe_dfs.get(60)
 
-        if df_1m.empty or df_60m.empty:
+        if df_1m is None or df_60m is None or df_1m.empty or df_60m.empty:
             continue
         if df_1m.isnull().values.any() or df_60m.isnull().values.any():
             continue
 
         current_price = df_1m["trade_price"].iloc[-1]
 
-        # 최고가 갱신
         if market not in highest_prices:
             highest_prices[market] = current_price
         else:
@@ -727,15 +728,12 @@ def track_sell_signals():
         sell_condition_met = False
         sell_volume_ratio = 1.0
 
-        # 손절 조건
         if not np.isnan(atr_1m) and (avg_buy_price - current_price) > (atr_1m * 2.0):
             send_slack_message(f"[Sell SL (ATR)] {market} 손실: {profit_loss_ratio:.2f}%")
             sell_condition_met = True
         elif profit_loss_ratio <= -5.0:
             send_slack_message(f"[Sell SL (Fixed)] {market} 손실: {profit_loss_ratio:.2f}%")
             sell_condition_met = True
-
-        # 익절 조건
         elif not np.isnan(atr_1m) and (current_price - avg_buy_price) > (atr_1m * 3.0):
             send_slack_message(f"[Sell TP (ATR)] {market} 이익: {profit_loss_ratio:.2f}%")
             sell_condition_met = True
@@ -744,44 +742,31 @@ def track_sell_signals():
             send_slack_message(f"[Sell TP (Fixed)] {market} 이익: {profit_loss_ratio:.2f}%")
             sell_condition_met = True
             sell_volume_ratio = 0.5
-
-        # Supertrend 변곡점
         elif supertrend_prev_1m and not supertrend_1m:
             send_slack_message(f"[Supertrend Flip] {market}")
             sell_condition_met = True
             sell_volume_ratio = 0.7
-
-        # MACD 데드크로스
         elif macd_1m < macd_signal_1m and df_1m["macd"].iloc[-2] > df_1m["macd_signal"].iloc[-2]:
             send_slack_message(f"[MACD Death Cross] {market}")
             sell_condition_met = True
             sell_volume_ratio = 0.5
-
-        # RSI 하락 전환
         elif rsi_1m > 70 and df_1m["rsi"].iloc[-2] > rsi_1m:
             send_slack_message(f"[RSI Overbought Drop] {market}")
             sell_condition_met = True
             sell_volume_ratio = 0.3
-
-        # ICT 조합
         elif bearish_ob and (liquidity_sweep_up or fvg) and mss_bearish:
             send_slack_message(f"[ICT Bearish Combo] {market}")
             sell_condition_met = True
             sell_volume_ratio = 1.0
-
-        # ✅ 추가된 조건 ①: 트레일링 스탑
         elif should_trail_stop(highest_prices[market], current_price):
             send_slack_message(f"[Trailing Stop] {market} 고점대비 하락으로 매도")
             sell_condition_met = True
             sell_volume_ratio = 1.0
-
-        # ✅ 추가된 조건 ②: 변동성 부족한 종목 청산
         elif should_clear_inefficient_positions(df_1m):
             send_slack_message(f"[Low Volatility] {market} 정체 → 매도")
             sell_condition_met = True
             sell_volume_ratio = 1.0
 
-        # 매도 실행
         if sell_condition_met:
             trade_volume = volume * sell_volume_ratio
             if trade_volume * current_price < MINIMUM_ORDER_KRW:
@@ -799,7 +784,7 @@ def track_sell_signals():
                 else:
                     time.sleep(5)
                     order_info = get_order(order_uuid)
-                    if order_info and order_info['state'] == 'done':
+                    if order_info and isinstance(order_info, dict) and order_info.get('state') == 'done':
                         executed_price = float(order_info.get('price', current_price))
                         executed_volume = float(order_info['executed_volume'])
                         profit = (executed_price - avg_buy_price) * executed_volume
@@ -835,15 +820,14 @@ def track_sell_signals():
 #             logger.error(f"Error in Slack command handler: {e}")
 #         time.sleep(5) # 5초마다 확인 (폴링 방식)
 
+# Slack 명령은 Events API 또는 파일 기반 감지로 처리 필요
 def handle_slack_commands():
-    """Slack 명령어 처리"""
     while not stop_trading.is_set():
-        response = requests.get(SLACK_WEBHOOK_URL)
-        if response.status_code == 200:
-            messages = response.json()
-            if "stop trading" in messages.get("text", "").lower():
-                send_slack_message("[Command Received] Stopping trading bot.")
-                os.kill(os.getpid(), signal.SIGTERM)
+        if os.path.exists("stop_command.txt"):
+            with open("stop_command.txt", "r") as f:
+                if "stop trading" in f.read().lower():
+                    send_slack_message("[Command Received] Stopping trading bot.")
+                    os.kill(os.getpid(), signal.SIGTERM)
         time.sleep(5)
 
 def main():
