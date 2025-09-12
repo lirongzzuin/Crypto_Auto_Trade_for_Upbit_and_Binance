@@ -1,883 +1,1059 @@
+import os
 import time
-import requests
-import pandas as pd
-pd.set_option('future.no_silent_downcasting', True)
-import numpy as np
+import math
 import logging
-import signal
-import pyupbit
-import os
-import uuid
 import threading
+import signal
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+import requests
+import pyupbit
 from dotenv import load_dotenv
 
-# 환경 변수 로드
-load_dotenv()
+pd.set_option('future.no_silent_downcasting', True)
 
-import os
-from dotenv import load_dotenv
-
-# .env 파일이 상위 폴더에 있는 경우 경로 지정
-load_dotenv(dotenv_path="../.env")
-
+# ================== 환경설정 ==================
+load_dotenv(dotenv_path=os.getenv("ENV_PATH", "../.env"))
 ACCESS_KEY = os.getenv("ACCESS_KEY")
 SECRET_KEY = os.getenv("SECRET_KEY")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-SERVER_URL = 'https://api.upbit.com'
 
-# 로깅 설정
-logging.basicConfig(filename="auto_trading.log", level=logging.INFO, format="%(asctime)s - %(message)s")
-logger = logging.getLogger()
+# -------- 로깅 --------
+logging.basicConfig(
+    filename="auto_trading.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("autotrade")
 
-# 전역 변수 초기화 (initialize_trading_data 함수에서 실제 초기화)
-buy_prices = {}
-total_profit = 0.0
-total_invested = 0.0
-last_buy_time = {}
-highest_prices = {}  # 만약 사용 중이라면
-
-last_sell_signal_check = 0  # ← 이 줄 추가
-
-# 설정값
-INTERVAL = 60  # 1분마다 실행
-BUY_RATIO_PER_ASSET = 0.2  # 종목당 3% (ATR 반영해 1.5%~3% 사이로 자동 조절)
-MINIMUM_ORDER_KRW = 5000
-MINIMUM_VOLUME_THRESHOLD = 0.0001
-MINIMUM_EVALUATION_KRW = 5000
-COOLDOWN_PERIOD_BUY = 180  # 3분으로 단축 (급등시 빠른 분할진입 가능)
-COOLDOWN_PERIOD_SELL = 60
-SELL_SIGNAL_CHECK_INTERVAL = 300  # 5분마다 매도 신호 확인 (급변 대응)
-MAX_CONCURRENT_TRADES = 15  # 상승장 대비 포지션 확장 (시장 흐름에 따라 최대 5도 가능)
-
+# ================== 전역 상태 ==================
+buy_prices: Dict[str, float] = {}
+total_profit: float = 0.0
+last_buy_time: Dict[str, float] = {}
+highest_prices: Dict[str, float] = {}
 stop_trading = threading.Event()
 
-# API 요청 제한 관리
-REQUEST_LIMIT_PER_SECOND = 10 # Upbit API 요청 제한 (실제로는 더 보수적으로 10회/초)
+# 포지션 메타(초기 리스크/TP 단계/진입시각/스톱)
+position_meta: Dict[str, Dict[str, float]] = {}
+# 손실 직후 쿨다운 트래킹
+last_loss_time: Dict[str, float] = {}
+
+# 일간 드로우다운 컷을 위한 에쿼티 스냅샷
+day_start_equity: float = 0.0
+day_of_snapshot: str = ""
+
+# ================== 파라미터 ==================
+INTERVAL = 10
+REQUEST_LIMIT_PER_SECOND = 5
+MINIMUM_ORDER_KRW = 5000
+MINIMUM_EVALUATION_KRW = 5000
+
+COOLDOWN_PERIOD_BUY = 60
+COOLDOWN_AFTER_LOSS_SEC = 900
+
+MAX_CONCURRENT_TRADES = 10
+TOP_VOLUME_POOL = 100
+PORTFOLIO_BUY_RATIO = 0.30
+MIN_BUY_KRW = 6000
+MAX_BUY_KRW = 3_000_000
+
+CHASE_UP_PCT_BLOCK = 15.0
+RSI_MAX_ENTRY = 90
+
+FIXED_STOP_LOSS = -3.0          
+FIXED_TAKE_PROFIT = 7           
+ATR_TP_MULT = 3
+ATR_SL_MULT = 1.5
+TRAILING_STOP_PCT = 2.5
+
+LIMIT_OFFSET_BUY = -0.0005
+LIMIT_OFFSET_SELL = +0.0010
+LIMIT_TIMEOUT_SEC = 15
+FAST_MOVE_PCT = 0.8
+MAX_SLIPPAGE_PCT = 0.9
+
+FEE_RATE = 0.0005
+SAFETY_BUY_BUFFER = 0.003
+SAFETY_SELL_BUFFER = 0.0
+RETRY_ON_INSUFFICIENT = 2
+RETRY_BACKOFF_SEC = 1.0
+
+# ===== 신규 리스크/필터 파라미터 =====
+RISK_PER_TRADE = 0.005           # 계좌 대비 0.5% 위험
+TP1_R = 1.0                      # 1R 부분익절
+TP2_R = 2.0                      # 2R 추가 익절
+BREAK_EVEN_BUFFER_PCT = 0.15     # BE 이동 시 수수료+버퍼(%) 
+DAILY_MAX_DRAWDOWN_PCT = 5.0     # 하루 -5% 도달 시 중지
+SPREAD_MAX_PCT = 0.30            # 스프레드 한도
+MIN_PRICE_KRW = 20               # 리스크 높은 초저가 코인 배제
+
 REQUEST_COUNT = 0
 LAST_REQUEST_TIME = time.time()
+upbit = None
 
-# Upbit 객체 초기화
-upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
-
-# --- 유틸리티 함수 ---
+# ================== 레이트 리밋/Slack ==================
 def rate_limit():
     global REQUEST_COUNT, LAST_REQUEST_TIME
-    current_time = time.time()
-    if current_time - LAST_REQUEST_TIME >= 1:
+    now = time.time()
+    if now - LAST_REQUEST_TIME >= 1:
         REQUEST_COUNT = 0
-        LAST_REQUEST_TIME = current_time
+        LAST_REQUEST_TIME = now
     REQUEST_COUNT += 1
     if REQUEST_COUNT > REQUEST_LIMIT_PER_SECOND:
-        sleep_time = 1 - (current_time - LAST_REQUEST_TIME)
-        time.sleep(max(sleep_time, 0))
+        time.sleep(max(0, 1 - (now - LAST_REQUEST_TIME)))
 
-def send_slack_message(message):
+def send_slack_message(message: str):
     if not SLACK_WEBHOOK_URL:
-        logger.error("Slack Webhook URL is not configured.")
         return
-    payload = {"text": message}
     try:
         rate_limit()
-        response = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=5)
-        response.raise_for_status()
-    except requests.exceptions.Timeout:
-        logger.error(f"Slack message timed out: {message}")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Slack message failed for '{message}': {e}")
+        requests.post(SLACK_WEBHOOK_URL, json={"text": message}, timeout=5)
+    except Exception as e:
+        logger.warning(f"Slack send failed: {e}")
 
-def handle_stop_signal(signal_received, frame):
-    global total_profit
-    send_slack_message(f"Automated trading stopped. Total profit: {total_profit:.2f} KRW.")
+def handle_stop_signal(sig, frame):
+    send_slack_message("자동매매 종료 신호 수신. 안전 종료합니다.")
     stop_trading.set()
-    logger.info("Trading bot stopped by stop signal.")
 
-def get_balance(ticker):
-    """지정된 티커의 잔고를 조회합니다. (KRW-BTC -> BTC)"""
-    rate_limit()
-    balances = upbit.get_balances()
-    for b in balances:
-        if b["currency"] == ticker.replace("KRW-", ""):
-            return float(b.get("balance", 0)), float(b.get("avg_buy_price", 0))
-    return 0.0, 0.0 # 잔고, 평균 매수 단가
-
-def get_owned_coins():
-    """보유하고 있는 코인들의 목록을 반환합니다."""
-    balances = upbit.get_balances()
-    owned = {}
-    for b in balances:
-        if b['currency'] != 'KRW' and float(b['balance']) > MINIMUM_VOLUME_THRESHOLD:
-            market_code = f"KRW-{b['currency']}"
-            if float(b['balance']) * float(b['avg_buy_price']) >= MINIMUM_EVALUATION_KRW:
-                owned[market_code] = float(b['balance'])
-    return owned
-
-def place_market_order(side, market, volume=None, price=None):
-    """
-    시장가 주문을 실행합니다.
-    side: "bid" (매수) 또는 "ask" (매도)
-    market: 마켓 코드 (예: "KRW-BTC")
-    volume: 매도 시 주문 수량
-    price: 매수 시 주문 금액 (원화)
-    """
+# ================== API 유틸 ==================
+def get_markets_krw() -> List[str]:
     try:
-        rate_limit()
-        identifier = str(uuid.uuid4())
-        order_result = None
-
-        if side == "bid":
-            if price is None or price < MINIMUM_ORDER_KRW:
-                logger.warning(f"[Buy Skipped] {market} 주문 금액 부족: {price}")
-                return None
-            order_result = upbit.buy_market_order(market, price)
-            if order_result:
-                send_slack_message(f"[Buy Order] {market} 매수 {price:.2f} KRW | UUID: {identifier}")
-
-        elif side == "ask":
-            if volume is None or volume * pyupbit.get_current_price(market) < MINIMUM_ORDER_KRW:
-                logger.warning(f"[Sell Skipped] {market} 주문 수량 부족: {volume}")
-                return None
-            order_result = upbit.sell_market_order(market, volume)
-            if order_result:
-                send_slack_message(f"[Sell Order] {market} 매도 {volume:.4f}개 | UUID: {identifier}")
-
-        if order_result and 'uuid' in order_result:
-            return order_result
-        elif order_result and 'error' not in order_result:
-            return {'uuid': 'immediate_execution', 'state': 'done', **order_result}
-        else:
-            logger.error(f"Failed to place {side} order for {market}: {order_result}")
-            send_slack_message(f"[Error] 주문 실패: {side} {market}: {order_result}")
-            return None
-
+        return pyupbit.get_tickers(fiat="KRW")
     except Exception as e:
-        logger.error(f"Exception placing {side} order for {market}: {e}")
-        send_slack_message(f"[Error] Exception during order: {side} {market}: {e}")
-        return None
-
-def get_order(uuid_or_market, state='done'):
-    """현재 완료된 주문 정보를 가져오는 함수 (Upbit API Wrapper 사용)"""
-    try:
-        rate_limit()
-        # pyupbit의 get_order는 uuid 또는 ticker_or_uuid를 받음
-        result = upbit.get_order(ticker_or_uuid=uuid_or_market, state=state)
-        return result
-    except Exception as e:
-        logger.error(f"Error fetching order {uuid_or_market}: {e}")
-        send_slack_message(f"[Order Check Fail] UUID: {uuid_or_market} 에 대한 체결 확인 실패")
-        return None
-
-# --- 데이터 로드 함수 ---
-def get_markets():
-    """업비트의 모든 KRW 마켓 리스트를 반환"""
-    url = f"{SERVER_URL}/v1/market/all"
-    try:
-        rate_limit()
-        response = requests.get(url)
-        if response.status_code == 200:
-            return [market["market"] for market in response.json() if market["market"].startswith("KRW")]
-        else:
-            logger.error(f"Failed to fetch markets: status_code={response.status_code}")
-            return []
-    except Exception as e:
-        logger.error(f"Exception while fetching markets: {e}")
+        logger.error(f"get_tickers failed: {e}")
         return []
 
-def get_candles_minutes(market, unit=1, count=200, retries=3, delay=10):
-    url = f"{SERVER_URL}/v1/candles/minutes/{unit}"
-    params = {'market': market, 'count': count}
-    for attempt in range(retries):
+def get_ohlcv(market: str, interval: str = "1m", count: int = 200) -> pd.DataFrame:
+    try:
         rate_limit()
-        response = requests.get(url, params=params)
-        if response.status_code == 200:
-            data = response.json()
-            df = pd.DataFrame(data)
-            if df.empty:
-                return pd.DataFrame()
-            # 컬럼 이름 통일: trade_price, high_price, low_price, open_price, candle_acc_trade_volume
-            df = df.rename(columns={
-                'trade_price': 'trade_price',
-                'high_price': 'high_price',
-                'low_price': 'low_price',
-                'opening_price': 'open_price',
-                'candle_acc_trade_volume': 'candle_acc_trade_volume'
-            })
-            df = df.sort_values(by='timestamp', ascending=True).reset_index(drop=True)
-            return df[['trade_price', 'high_price', 'low_price', 'open_price', 'candle_acc_trade_volume']]
-        elif response.status_code == 429:
-            logger.warning(f"Rate limit exceeded for {market} (unit {unit}). Retrying after {delay} seconds...")
-            time.sleep(delay)
-            delay *= 2
-        else:
-            logger.error(f"Failed to fetch candles for {market} (unit {unit}): {response.status_code}")
-            break
-    return pd.DataFrame()
+        df = pyupbit.get_ohlcv(market, interval=interval, count=count)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.rename(columns={
+            "open": "open_price",
+            "high": "high_price",
+            "low": "low_price",
+            "close": "trade_price",
+            "volume": "candle_acc_trade_volume",
+            "value": "candle_acc_trade_value"
+        })
+        return df
+    except Exception as e:
+        logger.warning(f"get_ohlcv({market},{interval}) failed: {e}")
+        return pd.DataFrame()
 
-def get_candles_minutes_multiple(market, units=[1, 60, 240]):
-    result = {}
-    for unit in units:
-        df = pyupbit.get_ohlcv(market, interval=f"{unit}m")
-        if df is not None and not df.empty:
-            # 컬럼명 변경
-            df = df.rename(columns={
-                'close': 'trade_price',
-                'high': 'high_price',
-                'low': 'low_price',
-                'open': 'open_price',
-                'volume': 'candle_acc_trade_volume'
-            })
-            df = calculate_indicators(df)
-            result[unit] = df
-    return result
+def get_balances_safe():
+    try:
+        rate_limit()
+        return upbit.get_balances()
+    except Exception as e:
+        logger.warning(f"get_balances failed: {e}")
+        return []
 
+def get_current_price_safe(market: str) -> float:
+    try:
+        rate_limit()
+        price = pyupbit.get_current_price(market)
+        return float(price) if price is not None else np.nan
+    except Exception:
+        return np.nan
 
-# --- 지표 계산 함수 ---
-def calculate_rsi(prices, window=14):
-    if len(prices) < window: return pd.Series([np.nan] * len(prices))
-    delta = prices.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+def get_orderbook_spread_pct(market: str) -> float:
+    try:
+        rate_limit()
+        ob = pyupbit.get_orderbook(tickers=market)
+        if not ob: return np.inf
+        unit = ob[0]
+        bids = unit.get("orderbook_units", [])
+        if not bids: return np.inf
+        best_ask = float(bids[0]["ask_price"])
+        best_bid = float(bids[0]["bid_price"])
+        mid = (best_ask + best_bid) / 2.0
+        if mid <= 0: return np.inf
+        return (best_ask - best_bid) / mid * 100.0
+    except Exception:
+        return np.inf
 
-def calculate_macd(prices):
-    if len(prices) < 26: return pd.Series([np.nan] * len(prices)), pd.Series([np.nan] * len(prices))
-    ema12 = prices.ewm(span=12, adjust=False).mean()
-    ema26 = prices.ewm(span=26, adjust=False).mean()
+def get_balance(currency_or_krw_pair: str) -> Tuple[float, float]:
+    cur = currency_or_krw_pair.replace("KRW-", "")
+    bals = get_balances_safe()
+    for b in bals:
+        if b.get("currency") == cur:
+            return float(b.get("balance", 0) or 0), float(b.get("avg_buy_price", 0) or 0)
+    return 0.0, 0.0
+
+# ================== 안전 접근 유틸 ==================
+def safe_val(df: pd.DataFrame, col: str, idx: int, default=np.nan):
+    try:
+        return df[col].iloc[idx]
+    except Exception:
+        return default
+
+def ema(series: pd.Series, span: int) -> pd.Series:
+    if series is None or series.empty:
+        return pd.Series(dtype=float)
+    return series.ewm(span=span, adjust=False).mean()
+
+# ================== 지표 & ICT 유틸 ==================
+def calculate_rsi(series: pd.Series, window: int = 14) -> pd.Series:
+    if series is None or series.empty or len(series) < window + 2:
+        return pd.Series(index=(series.index if series is not None else None), dtype=float)
+    delta = series.diff()
+    up = delta.clip(lower=0).rolling(window).mean()
+    down = (-delta.clip(upper=0)).rolling(window).mean()
+    rs = up / down.replace(0, np.nan)
+    return (100 - (100 / (1 + rs))).astype(float)
+
+def calculate_macd(series: pd.Series):
+    if series is None or series.empty or len(series) < 26:
+        idx = series.index if isinstance(series, pd.Series) else None
+        empty = pd.Series(index=idx, dtype=float)
+        return empty, empty
+    ema12 = series.ewm(span=12, adjust=False).mean()
+    ema26 = series.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
     signal = macd.ewm(span=9, adjust=False).mean()
-    return macd, signal
+    return macd.astype(float), signal.astype(float)
 
-def calculate_adx(df, window=14):
-    if len(df) < window + 1: return pd.Series([np.nan] * len(df))
-    high = df["high_price"]
-    low = df["low_price"]
-    close = df["trade_price"]
-    plus_dm = high.diff().where(high.diff() > low.diff(), 0.0)
-    minus_dm = low.diff().where(low.diff() > high.diff(), 0.0)
+def calculate_atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
+    if df is None or df.empty or len(df) < window + 1:
+        return pd.Series(index=(df.index if df is not None else None), dtype=float)
+    high, low, close = df["high_price"], df["low_price"], df["trade_price"]
     tr = pd.concat([
-        high - low,
+        (high - low),
         (high - close.shift()).abs(),
         (low - close.shift()).abs()
     ], axis=1).max(axis=1)
-    atr = tr.rolling(window=window).mean()
-    plus_di = 100 * (plus_dm.rolling(window=window).mean() / atr)
-    minus_di = 100 * (minus_dm.rolling(window=window).mean() / atr)
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
-    return dx.rolling(window=window).mean()
+    return tr.rolling(window).mean().astype(float)
 
-def calculate_obv(df):
-    if df.empty: return df
-    obv = [0]
-    for i in range(1, len(df)):
-        if df["trade_price"].iloc[i] > df["trade_price"].iloc[i - 1]:
-            obv.append(obv[-1] + df["candle_acc_trade_volume"].iloc[i])
-        elif df["trade_price"].iloc[i] < df["trade_price"].iloc[i - 1]:
-            obv.append(obv[-1] - df["candle_acc_trade_volume"].iloc[i])
-        else:
-            obv.append(obv[-1])
-    df["obv"] = obv
-    return df
-
-def detect_fvg(df):
-    if len(df) < 3:
-        df["fvg"] = False
-        return df
-    fvg_up = (df["low_price"].shift(2) > df["high_price"])
-    fvg_down = (df["high_price"].shift(2) < df["low_price"])
-    df["fvg"] = fvg_up | fvg_down
-    return df
-
-def calculate_supertrend(df, atr_period=10, multiplier=3):
-    if len(df) < atr_period:
-        df["supertrend"] = False
-        return df
-
+def calculate_supertrend(df: pd.DataFrame, atr_period=10, multiplier=3.0) -> pd.Series:
+    if df is None or df.empty or len(df) < atr_period + 2:
+        return pd.Series([False]*len(df), index=(df.index if df is not None else None), dtype=bool)
     hl2 = (df["high_price"] + df["low_price"]) / 2
     tr = pd.concat([
         df["high_price"] - df["low_price"],
         (df["high_price"] - df["trade_price"].shift()).abs(),
         (df["low_price"] - df["trade_price"].shift()).abs()
     ], axis=1).max(axis=1)
-    atr = tr.rolling(window=atr_period).mean()
-    upperband = hl2 + (multiplier * atr)
-    lowerband = hl2 - (multiplier * atr)
-
-    supertrend_values = [False] * len(df)
+    atr = tr.rolling(atr_period).mean()
+    upper = hl2 + multiplier * atr
+    lower = hl2 - multiplier * atr
+    st = [False]*len(df)
     for i in range(1, len(df)):
-        if df["trade_price"].iloc[i] > upperband.iloc[i - 1]:
-            supertrend_values[i] = True
-        elif df["trade_price"].iloc[i] < lowerband.iloc[i - 1]:
-            supertrend_values[i] = False
+        if df["trade_price"].iloc[i] > upper.iloc[i-1]:
+            st[i] = True
+        elif df["trade_price"].iloc[i] < lower.iloc[i-1]:
+            st[i] = False
         else:
-            supertrend_values[i] = supertrend_values[i - 1]
+            st[i] = st[i-1]
+    return pd.Series(st, index=df.index, dtype=bool)
 
-    df["supertrend"] = supertrend_values
-    return df
+def detect_fvg(df: pd.DataFrame):
+    n = len(df)
+    bull = pd.Series([False]*n, index=df.index, dtype=bool)
+    bear = pd.Series([False]*n, index=df.index, dtype=bool)
+    bull_low = pd.Series([np.nan]*n, index=df.index, dtype=float)
+    bull_high = pd.Series([np.nan]*n, index=df.index, dtype=float)
+    if n < 3:
+        return bull, bear, bull_low, bull_high
+    cond_bull = df["low_price"] > df["high_price"].shift(2)
+    cond_bear = df["high_price"] < df["low_price"].shift(2)
+    bull[cond_bull.fillna(False)] = True
+    bear[cond_bear.fillna(False)] = True
+    bull_low[bull] = df["high_price"].shift(2)[bull]
+    bull_high[bull] = df["low_price"][bull]
+    return bull, bear, bull_low, bull_high
 
-def calculate_volume_momentum(df, window=5):
-    if len(df) < window: return pd.Series([np.nan] * len(df))
-    return df["candle_acc_trade_volume"].pct_change().rolling(window=window).mean()
+def detect_liquidity_sweep(df: pd.DataFrame, prev_swing_high: pd.Series, prev_swing_low: pd.Series):
+    up = ((df["high_price"] > prev_swing_high) & (df["trade_price"] < prev_swing_high)).fillna(False)
+    dn = ((df["low_price"] < prev_swing_low) & (df["trade_price"] > prev_swing_low)).fillna(False)
+    return up.astype(bool), dn.astype(bool)
 
-def calculate_atr(df, window=14):
-    if len(df) < window + 1: return pd.Series([np.nan] * len(df))
-    tr = pd.concat([
-        df['high_price'] - df['low_price'],
-        (df['high_price'] - df['trade_price'].shift()).abs(),
-        (df['low_price'] - df['trade_price'].shift()).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(window=window).mean()
+def detect_swings(df: pd.DataFrame, left: int = 2, right: int = 2) -> Tuple[pd.Series, pd.Series]:
+    high = df["high_price"]
+    low = df["low_price"]
+    sh = (high > high.shift(1)) & (high > high.shift(2)) & (high > high.shift(-1)) & (high > high.shift(-2))
+    sl = (low < low.shift(1)) & (low < low.shift(2)) & (low < low.shift(-1)) & (low < low.shift(-2))
+    return sh.fillna(False).astype(bool), sl.fillna(False).astype(bool)
 
-# --- ICT 기반 지표 함수 ---
-def detect_order_block(df, lookback=2):
-    """
-    불리쉬 오더블록과 베리쉬 오더블록을 감지합니다.
-    매우 단순화된 버전이며, 실제 ICT에서는 더 정교한 패턴 분석이 필요합니다.
-    """
-    df['bullish_ob'] = False
-    df['bearish_ob'] = False
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
 
-    if len(df) < lookback + 1: return df
-
-    for i in range(lookback, len(df)):
-        # 불리쉬 오더블록: 하락 후 마지막 하락 양봉 or 하락 음봉 (저점 형성)
-        # 예: 큰 음봉 후 작은 양봉 (매수 압력 시작) 또는 매수 거래량 증가하는 구간
-        # 현재는 이전 캔들 대비 현재 캔들의 종가가 높고 거래량이 높은 경우를 단순화
-        if df['trade_price'].iloc[i] > df['trade_price'].iloc[i-1] and \
-           df['candle_acc_trade_volume'].iloc[i] > df['candle_acc_trade_volume'].iloc[i-1] * 1.5:
-            df.loc[i, 'bullish_ob'] = True
-
-        # 베리쉬 오더블록: 상승 후 마지막 상승 음봉 or 상승 양봉 (고점 형성)
-        # 예: 큰 양봉 후 작은 음봉 (매도 압력 시작) 또는 매도 거래량 증가하는 구간
-        # 현재는 이전 캔들 대비 현재 캔들의 종가가 낮고 거래량이 높은 경우를 단순화
-        if df['trade_price'].iloc[i] < df['trade_price'].iloc[i-1] and \
-           df['candle_acc_trade_volume'].iloc[i] > df['candle_acc_trade_volume'].iloc[i-1] * 1.5:
-            df.loc[i, 'bearish_ob'] = True
-    return df
-
-def detect_liquidity_sweep(df):
-    """
-    유동성 스윕 (Liquidity Sweep)을 감지합니다.
-    이전 고점/저점을 잠깐 이탈 후 빠르게 되돌리는 움직임.
-    """
-    df['liquidity_sweep_up'] = False
-    df['liquidity_sweep_down'] = False
-
-    if len(df) < 3: return df
-
-    for i in range(2, len(df)):
-        # 상승 유동성 스윕 (고점 돌파 후 하락 전환)
-        # 이전 고점보다 현재 고점이 높지만, 현재 종가가 이전 종가보다 낮고 음봉으로 마감
-        if df['high_price'].iloc[i] > df['high_price'].iloc[i-1] and \
-           df['trade_price'].iloc[i] < df['trade_price'].iloc[i-1] and \
-           df['trade_price'].iloc[i] < df['open_price'].iloc[i]:
-            df.loc[i, 'liquidity_sweep_up'] = True
-
-        # 하락 유동성 스윕 (저점 이탈 후 상승 전환)
-        # 이전 저점보다 현재 저점이 낮지만, 현재 종가가 이전 종가보다 높고 양봉으로 마감
-        if df['low_price'].iloc[i] < df['low_price'].iloc[i-1] and \
-           df['trade_price'].iloc[i] > df['trade_price'].iloc[i-1] and \
-           df['trade_price'].iloc[i] > df['open_price'].iloc[i]:
-            df.loc[i, 'liquidity_sweep_down'] = True
-    return df
-
-def detect_market_structure_shift(df):
-    """
-    시장 구조 변화 (Market Structure Shift / Change of Character)를 감지합니다.
-    추세 전환의 초기 신호.
-    """
-    df['mss_bullish'] = False
-    df['mss_bearish'] = False
-
-    if len(df) < 5: return df # 최소 5개 캔들 필요
-
-    for i in range(4, len(df)):
-        # 불리쉬 MSS: 하락 추세 중 직전 고점 돌파 (Higher High) 후, 이전 저점보다 높은 저점 형성 (Higher Low)
-        # 예시: LL, LH, LL 패턴에서 LL 이후 LH를 돌파하는 경우
-        # 간략화된 조건: 현재 고점이 이전 고점보다 높고, 현재 저점이 2캔들 전 저점보다 높을 때
-        if df['high_price'].iloc[i] > df['high_price'].iloc[i-1] and \
-           df['low_price'].iloc[i] > df['low_price'].iloc[i-2]:
-            df.loc[i, 'mss_bullish'] = True
-
-        # 베리쉬 MSS: 상승 추세 중 직전 저점 이탈 (Lower Low) 후, 이전 고점보다 낮은 고점 형성 (Lower High)
-        # 예시: HH, HL, HH 패턴에서 HL을 이탈하는 경우
-        # 간략화된 조건: 현재 저점이 이전 저점보다 낮고, 현재 고점이 2캔들 전 고점보다 낮을 때
-        if df['low_price'].iloc[i] < df['low_price'].iloc[i-1] and \
-           df['high_price'].iloc[i] < df['high_price'].iloc[i-2]:
-            df.loc[i, 'mss_bearish'] = True
-    return df
-
-def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df["ema20"] = ema(df["trade_price"], 20)
+    df["ema50"] = ema(df["trade_price"], 50)
     df["rsi"] = calculate_rsi(df["trade_price"])
-    macd_line, macd_signal = calculate_macd(df["trade_price"])
-    df["macd"] = macd_line
-    df["macd_signal"] = macd_signal
-    df["adx"] = calculate_adx(df)
-    df = calculate_supertrend(df)
-    df = detect_order_block(df)
-    df = detect_fvg(df)
-    df = detect_liquidity_sweep(df)
-    df = detect_market_structure_shift(df)
+    macd, macd_sig = calculate_macd(df["trade_price"])
+    df["macd"] = macd
+    df["macd_signal"] = macd_sig
     df["atr"] = calculate_atr(df)
+    df["supertrend"] = calculate_supertrend(df)
 
-    # 누락된 컬럼 강제 삽입
-    required_cols = [
-        "rsi", "macd", "macd_signal", "adx", "supertrend",
-        "bullish_ob", "bearish_ob", "fvg",
-        "liquidity_sweep_down", "liquidity_sweep_up",
-        "mss_bullish", "mss_bearish", "atr"
-    ]
-    for col in required_cols:
-        if col not in df.columns:
-            df[col] = np.nan
+    bull_fvg, bear_fvg, bull_low, bull_high = detect_fvg(df)
+    df["fvg_bull"] = bull_fvg
+    df["fvg_bear"] = bear_fvg
+    df["fvg_bull_low_raw"] = bull_low
+    df["fvg_bull_high_raw"] = bull_high
+    df["fvg_bull_low"] = df["fvg_bull_low_raw"].ffill()
+    df["fvg_bull_high"] = df["fvg_bull_high_raw"].ffill()
+    df["in_bull_fvg"] = ((df["trade_price"] >= df["fvg_bull_low"]) & (df["trade_price"] <= df["fvg_bull_high"])).fillna(False)
+
+    bear_low_raw = df["high_price"].where(df["fvg_bear"])
+    bear_high_raw = df["low_price"].shift(2).where(df["fvg_bear"])
+    df["fvg_bear_low"] = bear_low_raw.ffill()
+    df["fvg_bear_high"] = bear_high_raw.ffill()
+    df["in_bear_fvg"] = ((df["trade_price"] <= df["fvg_bear_low"]) & (df["trade_price"] >= df["fvg_bear_high"])).fillna(False)
+
+    swing_high, swing_low = detect_swings(df)
+    df["swing_high"] = swing_high
+    df["swing_low"] = swing_low
+    sh_price = df["high_price"].where(df["swing_high"])
+    sl_price = df["low_price"].where(df["swing_low"])
+    df["prev_swing_high"] = sh_price.ffill()
+    df["prev_swing_low"] = sl_price.ffill()
+    buf = 0.0002
+    df["bos_up"] = (df["trade_price"] > (df["prev_swing_high"] * (1 + buf))).fillna(False)
+    df["bos_dn"] = (df["trade_price"] < (df["prev_swing_low"] * (1 - buf))).fillna(False)
+
+    df["dr_high"] = df["prev_swing_high"]
+    df["dr_low"] = df["prev_swing_low"]
+    df["dr_mid"] = (df["dr_high"] + df["dr_low"]) / 2.0
+    rng = (df["dr_high"] - df["dr_low"]).replace(0, np.nan)
+    df["ote_low"] = df["dr_low"] + 0.62 * rng
+    df["ote_high"] = df["dr_low"] + 0.79 * rng
+    df["discount_zone"] = (df["trade_price"] <= df["dr_mid"]).fillna(False)
+    df["premium_zone"] = (df["trade_price"] >= df["dr_mid"]).fillna(False)
+    df["in_ote_long"] = ((df["trade_price"] >= df["ote_low"]) & (df["trade_price"] <= df["ote_high"])).fillna(False)
+
+    ls_up, ls_dn = detect_liquidity_sweep(df, df["prev_swing_high"], df["prev_swing_low"])
+    df["liquidity_sweep_up"] = ls_up
+    df["liquidity_sweep_down"] = ls_dn
+
+    vol = df["candle_acc_trade_volume"].fillna(0)
+    px = df["trade_price"]
+    bull_ob = (px > px.shift()) & (vol > vol.shift()*1.5)
+    bear_ob = (px < px.shift()) & (vol > vol.shift()*1.5)
+    df["bullish_ob"] = bull_ob.fillna(False).astype(bool)
+    df["bearish_ob"] = bear_ob.fillna(False).astype(bool)
 
     df.ffill(inplace=True)
-    df.infer_objects(copy=False)
+    df.bfill(inplace=True)
+    for col in ["supertrend","fvg_bull","fvg_bear","in_bull_fvg","in_bear_fvg","swing_high","swing_low",
+                "bos_up","bos_dn","discount_zone","premium_zone","in_ote_long",
+                "liquidity_sweep_up","liquidity_sweep_down","bullish_ob","bearish_ob"]:
+        if col in df.columns:
+            df[col] = df[col].astype(bool)
     return df
 
-# --- 트레이딩 로직 ---
-def initialize_trading_data():
-    global buy_prices, total_profit, total_invested, last_buy_time, highest_prices
-    send_slack_message("[Info] Initializing trading data...")
+# ================== 스캐너/레짐 ==================
+def pick_universe_by_krw_volume() -> List[str]:
+    markets = get_markets_krw()
+    scores = []
+    for m in markets:
+        df_day = get_ohlcv(m, interval="day", count=2)
+        if df_day.empty: continue
+        last_price = float(safe_val(df_day, "trade_price", -1, 0))
+        last_vol = float(safe_val(df_day, "candle_acc_trade_volume", -1, 0))
+        if last_price < MIN_PRICE_KRW:  # 초저가 배제
+            continue
+        v_krw = last_vol * last_price
+        scores.append((m, v_krw))
+    scores.sort(key=lambda x: x[1], reverse=True)
+    top = [m for m, _ in scores[:TOP_VOLUME_POOL]]
+    # 스프레드 필터
+    filtered = []
+    for m in top:
+        sp = get_orderbook_spread_pct(m)
+        if sp <= SPREAD_MAX_PCT:
+            filtered.append(m)
+    return filtered
 
-    buy_prices = {}
-    total_profit = 0.0
-    total_invested = 0.0
-    last_buy_time = {}
-    highest_prices = {}
-
-    valid_markets = set(pyupbit.get_tickers(fiat="KRW"))
-
+def btc_regime_factor() -> float:
+    """BTC 15m 상향(EMA20>EMA50 or Supertrend True)이면 1.0, 아니면 0.5."""
     try:
-        balances = upbit.get_balances()
-        for balance in balances:
-            if balance['currency'] != 'KRW' and float(balance['balance']) > 0:
-                market_code = f"KRW-{balance['currency']}"
-                if market_code not in valid_markets:
-                    logger.warning(f"[Skip] {market_code} - 마켓 코드 유효하지 않음 (상장폐지 등)")
-                    continue
+        df = add_indicators(get_ohlcv("KRW-BTC", "15m", 200))
+        if df.empty: return 1.0
+        ema_ok = bool(safe_val(df, "ema20", -1, np.nan) > safe_val(df, "ema50", -1, np.nan))
+        st_ok = bool(safe_val(df, "supertrend", -1, False))
+        return 1.0 if (ema_ok or st_ok) else 0.5
+    except Exception:
+        return 1.0
 
-                avg_price = float(balance.get('avg_buy_price', 0))
-                current_price = pyupbit.get_current_price(market_code)
-
-                buy_prices[market_code] = avg_price
-                if current_price:
-                    highest_prices[market_code] = current_price
-
-                send_slack_message(f"[Info] Initialized {market_code} | 평균단가: {avg_price:.2f} | 현재가: {current_price:.2f}")
-    except Exception as e:
-        logger.error(f"Failed to initialize buy prices from balances: {e}")
-        send_slack_message(f"[Error] Failed to initialize buy prices: {e}")
-
-def update_highest_price():
-    balances = upbit.get_balances()
+# ================== 초기화/리포트 ==================
+def initialize_trading_data():
+    global buy_prices, highest_prices, position_meta, day_start_equity, day_of_snapshot
+    buy_prices.clear()
+    highest_prices.clear()
+    position_meta.clear()
+    balances = get_balances_safe()
+    valid = set(get_markets_krw())
     for b in balances:
-        if b["currency"] == "KRW": continue
-        market = f"KRW-{b['currency']}"
-        rate_limit()
-        current_price = pyupbit.get_current_price(market)
-        prev_high = float(b.get("highest_price", 0))
-        if current_price > prev_high:
-            highest_prices[market] = current_price  # dict로 유지 필요 (실제로는 DB 또는 파일 저장 권장)
+        cur = b.get("currency")
+        if cur == "KRW": continue
+        m = f"KRW-{cur}"
+        if m not in valid: continue
+        avg = float(b.get("avg_buy_price", 0) or 0)
+        if avg > 0:
+            buy_prices[m] = avg
+            cp = get_current_price_safe(m)
+            if not np.isnan(cp):
+                highest_prices[m] = cp
+    eq = portfolio_value_krw()
+    day_start_equity = eq
+    day_of_snapshot = time.strftime("%Y-%m-%d")
+    send_slack_message(f"[Start] 초기화 완료 / 시작 에쿼티: {eq:,.0f} KRW")
 
 def generate_daily_report():
     try:
-        balances = upbit.get_balances()
-        valid_markets = set(pyupbit.get_tickers(fiat="KRW"))
-        report_lines = ["[Daily Summary]"]
-
-        for b in balances:
-            currency = b.get("currency")
-            if currency == "KRW":
+        bals = get_balances_safe()
+        valid = set(get_markets_krw())
+        lines = ["[Daily Summary]"]
+        for b in bals:
+            cur = b.get("currency")
+            if cur == "KRW":
                 continue
-
-            market = f"KRW-{currency}"
-            balance = float(b.get("balance", 0))
-            avg_buy = float(b.get("avg_buy_price", 0))
-
-            if balance == 0 or avg_buy == 0:
+            m = f"KRW-{cur}"
+            if m not in valid:
                 continue
-
-            if market not in valid_markets:
-                report_lines.append(f"{market}: 상장폐지 또는 거래 중단")
+            bal = float(b.get("balance", 0) or 0)
+            avg = float(b.get("avg_buy_price", 0) or 0)
+            if bal == 0 or avg == 0:
                 continue
-
-            try:
-                current_price = pyupbit.get_current_price(market)
-                if current_price is None:
-                    report_lines.append(f"{market}: 현재가 조회 실패")
-                    continue
-
-                pl = (current_price - avg_buy) * balance
-                rate = ((current_price - avg_buy) / avg_buy) * 100
-                report_lines.append(f"{market}: {pl:.2f} KRW ({rate:.2f}%)")
-
-            except Exception as e:
-                if "Code not found" in str(e):
-                    report_lines.append(f"{market}: 마켓 코드 없음 (상장폐지 가능)")
-                else:
-                    report_lines.append(f"{market}: 가격 조회 오류 - {str(e)}")
-
-        if len(report_lines) == 1:
-            report_lines.append("보유 중인 자산이 없습니다.")
-
-        send_slack_message("\n".join(report_lines))
-
+            cp = get_current_price_safe(m)
+            if np.isnan(cp):
+                continue
+            pnl = (cp - avg) * bal
+            rate = (cp - avg) / avg * 100
+            lines.append(f"{m}: {pnl:.0f} KRW ({rate:.2f}%)")
+        if len(lines) == 1:
+            lines.append("보유 자산 없음")
+        send_slack_message("\n".join(lines))
     except Exception as e:
-        send_slack_message(f"[Error] 리포트 생성 중 예외 발생: {str(e)}")
+        logger.warning(f"daily report failed: {e}")
 
 def start_report_thread():
-    def report_loop():
+    def loop():
         while not stop_trading.is_set():
             generate_daily_report()
-            time.sleep(86400)  # 하루에 한 번
-    threading.Thread(target=report_loop, daemon=True).start()
+            time.sleep(86400)
+    threading.Thread(target=loop, daemon=True).start()
 
-def track_buy_signals():
-    global total_invested, last_buy_time, buy_prices
-
-    balances = upbit.get_balances()
-    balance_krw = 0.0
-    total_asset_value = 0.0
-    owned_currencies = set()
-
-    for balance in balances:
-        if balance['currency'] == 'KRW':
-            balance_krw = float(balance['balance'])
+# ================== 포트폴리오/보유 ==================
+def portfolio_value_krw() -> float:
+    bals = get_balances_safe()
+    total = 0.0
+    for b in bals:
+        cur = b.get("currency")
+        bal = float(b.get("balance", 0) or 0)
+        if cur == "KRW":
+            total += bal
         else:
-            asset_balance = float(balance['balance'])
-            avg_buy_price = float(balance.get('avg_buy_price', 0))
-            if avg_buy_price > 0:
-                total_asset_value += asset_balance * avg_buy_price
-            owned_currencies.add(balance['currency'])
+            m = f"KRW-{cur}"
+            cp = get_current_price_safe(m)
+            if np.isnan(cp):
+                continue
+            total += bal * cp
+    return total
 
-    total_asset_value += balance_krw
-
-    if len(owned_currencies) >= MAX_CONCURRENT_TRADES:
-        logger.info(f"[Skip] 보유 종목이 {MAX_CONCURRENT_TRADES}개 이상입니다.")
-        return
-
-    if balance_krw < MINIMUM_ORDER_KRW:
-        logger.info(f"[Skip] 사용 가능한 잔액 부족: {balance_krw:.2f} KRW")
-        return
-
-    def safe_get(series, index=-1):
-        try:
-            return series.iloc[index]
-        except:
-            return np.nan
-
-    for market in get_markets():
-        if market in last_buy_time and (time.time() - last_buy_time[market] < COOLDOWN_PERIOD_BUY):
+def owned_markets() -> Dict[str, float]:
+    out = {}
+    for b in get_balances_safe():
+        cur = b.get("currency")
+        if cur == "KRW":
             continue
+        bal = float(b.get("balance", 0) or 0)
+        m = f"KRW-{cur}"
+        cp = get_current_price_safe(m)
+        if not np.isnan(cp) and bal * cp >= MINIMUM_EVALUATION_KRW:
+            out[m] = bal
+    return out
 
-        multi_timeframe_dfs = get_candles_minutes_multiple(market, units=[1, 60, 240])
-        df_1m = multi_timeframe_dfs.get(1)
-        df_60m = multi_timeframe_dfs.get(60)
-        df_240m = multi_timeframe_dfs.get(240)
+# ================== 호가/체결 보정 ==================
+def upbit_tick_size(krw_price: float) -> float:
+    if krw_price >= 2_000_000: return 1000
+    if krw_price >= 1_000_000: return 500
+    if krw_price >= 500_000:   return 100
+    if krw_price >= 100_000:   return 50
+    if krw_price >= 10_000:    return 10
+    if krw_price >= 1_000:     return 1
+    if krw_price >= 100:       return 0.1
+    if krw_price >= 10:        return 0.01
+    if krw_price >= 1:         return 0.001
+    return 0.0001
 
-        if df_1m is None or df_1m.empty or df_1m.isnull().values.any():
-            continue
-        if df_60m is None or df_240m is None:
-            continue
+def round_to_tick(price: float) -> float:
+    if price <= 0 or np.isnan(price): return price
+    tick = upbit_tick_size(price)
+    return math.floor(price / tick) * tick
 
-        for df in [df_1m, df_60m, df_240m]:
-            df.fillna(method="ffill", inplace=True)
-            for col in ["rsi", "macd", "macd_signal", "adx", "supertrend", "bullish_ob", "fvg", "liquidity_sweep_down", "atr"]:
-                if col not in df.columns:
-                    df[col] = np.nan
+def round_volume(v: float) -> float:
+    if v <= 0 or np.isnan(v): return 0.0
+    return float(f"{v:.8f}")
 
-        current_price = df_1m["trade_price"].iloc[-1]
-        existing_volume, existing_avg = get_balance(market.replace("KRW-", ""))
-        max_invested_per_coin = total_asset_value * 0.10
-        if existing_volume * current_price >= max_invested_per_coin:
-            continue
+# ================== 가용/부족자금 ==================
+def get_available_krw() -> float:
+    try:
+        for b in get_balances_safe():
+            if b.get("currency") == "KRW":
+                bal = float(b.get("balance", 0) or 0)
+                locked = float(b.get("locked", 0) or 0)
+                return max(0.0, bal - locked)
+    except Exception:
+        pass
+    return 0.0
 
-        is_bullish_trend_60m = safe_get(df_60m["supertrend"]) and safe_get(df_60m["macd"]) > safe_get(df_60m["macd_signal"])
-        is_bullish_trend_240m = safe_get(df_240m["supertrend"]) and safe_get(df_240m["macd"]) > safe_get(df_240m["macd_signal"])
-        if not (is_bullish_trend_60m and is_bullish_trend_240m):
-            continue
+def get_available_volume(market: str) -> float:
+    cur = market.replace("KRW-", "")
+    try:
+        for b in get_balances_safe():
+            if b.get("currency") == cur:
+                bal = float(b.get("balance", 0) or 0)
+                locked = float(b.get("locked", 0) or 0)
+                return max(0.0, bal - locked)
+    except Exception:
+        pass
+    return 0.0
 
-        rsi = safe_get(df_1m["rsi"])
-        macd = safe_get(df_1m["macd"])
-        macd_signal = safe_get(df_1m["macd_signal"])
-        adx = safe_get(df_1m["adx"])
-        supertrend_1m = safe_get(df_1m["supertrend"])
-        bullish_ob = safe_get(df_1m["bullish_ob"])
-        fvg = safe_get(df_1m["fvg"])
-        liquidity_sweep_down = safe_get(df_1m["liquidity_sweep_down"])
-        prev_macd = safe_get(df_1m["macd"], -2)
-        prev_signal = safe_get(df_1m["macd_signal"], -2)
-        macd_crossover = pd.notna(prev_macd) and pd.notna(prev_signal) and macd > macd_signal and prev_macd <= prev_signal
+def _insufficient_funds(e_or_res) -> bool:
+    s = ""
+    try:
+        s = str(e_or_res).lower()
+    except Exception:
+        pass
+    return ("insufficient" in s) and ("fund" in s or "bid" in s)
 
-        buy_condition_met = (
-            pd.notna(rsi) and rsi < 40 and
-            pd.notna(adx) and adx > 17 and
-            supertrend_1m and
-            pd.notna(macd) and pd.notna(macd_signal) and
-            macd_crossover and
-            (bullish_ob or fvg or liquidity_sweep_down)
-        )
+# ================== 실제 체결가(VWAP) ==================
+def get_order_fills(uuid: str) -> Tuple[float, float]:
+    try:
+        rate_limit()
+        od = upbit.get_order(uuid)
+        trades = od.get("trades", []) if isinstance(od, dict) else []
+        if not trades:
+            return np.nan, 0.0
+        total_cost = 0.0
+        total_vol = 0.0
+        for t in trades:
+            price = float(t.get("price", 0) or 0)
+            vol = float(t.get("volume", 0) or 0)
+            total_cost += price * vol
+            total_vol += vol
+        if total_vol <= 0:
+            return np.nan, 0.0
+        vwap = total_cost / total_vol
+        return float(vwap), float(total_vol)
+    except Exception as e:
+        logger.warning(f"get_order_fills failed: {e}")
+        return np.nan, 0.0
 
-        if not buy_condition_met:
-            continue
+# ================== 주문 엔진(지정가→시장가) ==================
+def place_limit_then_maybe_market(side: str, market: str, krw_amount: Optional[float]=None,
+                                  limit_price: Optional[float]=None, volume: Optional[float]=None,
+                                  timeout_sec: int=LIMIT_TIMEOUT_SEC, fast_move_pct: float=FAST_MOVE_PCT,
+                                  max_slip_pct: float=MAX_SLIPPAGE_PCT):
+    assert side in ("bid", "ask")
+    cur0 = get_current_price_safe(market)
+    if np.isnan(cur0):
+        return None
 
-        send_slack_message(f"[Buy Signal Detected] {market} - 조건 충족. 현재가: {current_price:.2f} KRW")
-
-        current_atr = safe_get(df_1m["atr"])
-        if not np.isnan(current_atr) and current_atr > 0:
-            atr_normalized = min(current_atr / current_price, 0.05)
-            adjusted_buy_ratio = BUY_RATIO_PER_ASSET * (1 - atr_normalized * 2)
-            adjusted_buy_ratio = max(adjusted_buy_ratio, BUY_RATIO_PER_ASSET * 0.5)
+    if limit_price is None:
+        if side == "bid":
+            limit_price = cur0 * (1 + LIMIT_OFFSET_BUY)
         else:
-            adjusted_buy_ratio = BUY_RATIO_PER_ASSET
+            limit_price = cur0 * (1 + LIMIT_OFFSET_SELL)
+    limit_price = round_to_tick(limit_price)
 
-        amount = total_asset_value * adjusted_buy_ratio
-        balance_krw, _ = get_balance("KRW")
-        amount = min(amount, balance_krw)
+    if side == "bid":
+        avail = get_available_krw()
+        if krw_amount is None:
+            krw_amount = avail
+        budget = min(krw_amount, avail)
+        headroom = (1.0 - (FEE_RATE + SAFETY_BUY_BUFFER))
+        headroom = max(headroom, 0.95)
+        eff_budget = max(0.0, budget * headroom)
+        if eff_budget < MINIMUM_ORDER_KRW:
+            return None
+        vol = round_volume(eff_budget / limit_price)
+        if vol * limit_price < MINIMUM_ORDER_KRW:
+            return None
 
-        if amount < MINIMUM_ORDER_KRW:
-            send_slack_message(f"[Skip] {market} 매수 금액 부족: {amount:.2f} KRW")
-            continue
-
-        try:
-            order = place_market_order("bid", market, price=amount)
-            if order:
-                order_uuid = order.get('uuid')
-                if order_uuid == 'immediate_execution':
-                    executed_volume = float(order.get('executed_volume', 0))
-                    executed_price = float(order.get('price', current_price))
-                    if executed_volume > 0:
-                        total_invested += executed_price * executed_volume
-                        last_buy_time[market] = time.time()
-                        send_slack_message(f"[Buy Completed] {market} 즉시 체결됨. 수량: {executed_volume:.4f}, 단가: {executed_price:.2f}")
-                        _, avg_price = get_balance(market.replace("KRW-", ""))
-                        buy_prices[market] = avg_price if avg_price > 0 else executed_price
+        attempt = 0
+        while attempt <= RETRY_ON_INSUFFICIENT:
+            placed = None
+            try:
+                rate_limit()
+                res = upbit.buy_limit_order(market, limit_price, vol)
+                if res and "error" in res and _insufficient_funds(res["error"]):
+                    raise RuntimeError("InsufficientFundsBid (payload)")
+                placed = res if (res and "uuid" in res) else None
+            except Exception as e:
+                if _insufficient_funds(e):
+                    placed = None
                 else:
-                    time.sleep(5)
-                    order_info = get_order(order_uuid)
-                    if order_info and order_info['state'] == 'done' and float(order_info['executed_volume']) > 0:
-                        executed_price = float(order_info.get('price', current_price))
-                        executed_volume = float(order_info['executed_volume'])
-                        fee = float(order_info.get('paid_fee', 0))
-                        total_invested += executed_price * executed_volume + fee
+                    logger.warning(f"buy_limit_order error: {e}")
+                    placed = None
 
-                        _, existing_avg = get_balance(market.replace("KRW-", ""))
-                        if existing_volume > 0 and existing_avg > 0:
-                            new_avg = ((existing_avg * existing_volume) + (executed_price * executed_volume)) / (existing_volume + executed_volume)
-                        else:
-                            new_avg = executed_price
-                        buy_prices[market] = new_avg
-                        last_buy_time[market] = time.time()
-                        send_slack_message(f"[Buy Completed] {market} 체결 완료. 수량: {executed_volume:.4f}, 평균 단가: {new_avg:.2f}")
-                    else:
-                        send_slack_message(f"[Order Failed] {market} - 주문 실패 또는 미체결 상태: {order_info}")
-                        last_buy_time[market] = time.time()
+            if placed:
+                uuid = placed["uuid"]
+                t0 = time.time()
+                base = cur0
+                while time.time() - t0 < timeout_sec and not stop_trading.is_set():
+                    try:
+                        rate_limit()
+                        od = upbit.get_order(uuid)
+                        remain_vol = float(od.get("remaining_volume", 0) or 0)
+                        state = od.get("state", "")
+                        cur2 = get_current_price_safe(market)
+                        if not np.isnan(cur2) and base > 0:
+                            move = abs((cur2 - base) / base) * 100
+                            if move >= fast_move_pct:
+                                try: upbit.cancel_order(uuid)
+                                except Exception: pass
+                                slip = ((cur2 - limit_price) / limit_price) * 100
+                                if slip > max_slip_pct:
+                                    send_slack_message(f"[경고] {market} 매수 슬리피지 {slip:.2f}% > {max_slip_pct:.2f}% → 주문 취소")
+                                    return None
+                                avail2 = get_available_krw()
+                                mrk_budget = min(avail2, remain_vol * limit_price) * headroom
+                                mrk_budget = math.floor(mrk_budget)
+                                if mrk_budget >= MINIMUM_ORDER_KRW:
+                                    return upbit.buy_market_order(market, mrk_budget)
+                                return od
+                        if state == "done" or remain_vol <= 1e-12:
+                            return od
+                    except Exception as e:
+                        logger.warning(f"monitor order {uuid} failed: {e}")
+                    time.sleep(2)
+
+                try:
+                    upbit.cancel_order(uuid)
+                except Exception:
+                    pass
+                cur3 = get_current_price_safe(market)
+                slip = ((cur3 - limit_price) / limit_price) * 100 if (not np.isnan(cur3) and limit_price > 0) else 0
+                if slip > max_slip_pct:
+                    send_slack_message(f"[경고] {market} 매수 슬리피지 {slip:.2f}% > {max_slip_pct:.2f}% → 주문 취소")
+                    return None
+                try:
+                    rate_limit()
+                    od = upbit.get_order(uuid)
+                    remain_vol = float(od.get("remaining_volume", 0) or 0)
+                except Exception:
+                    remain_vol = 0.0
+                avail3 = get_available_krw()
+                mrk_budget = min(avail3, remain_vol * limit_price) * headroom
+                mrk_budget = math.floor(mrk_budget)
+                if mrk_budget >= MINIMUM_ORDER_KRW:
+                    return upbit.buy_market_order(market, mrk_budget)
+                return None
+
+            attempt += 1
+            eff_budget *= 0.97
+            vol = round_volume(eff_budget / limit_price)
+            if eff_budget < MINIMUM_ORDER_KRW or vol * limit_price < MINIMUM_ORDER_KRW:
+                time.sleep(RETRY_BACKOFF_SEC)
+                continue
+            time.sleep(RETRY_BACKOFF_SEC)
+        return None
+
+    else:
+        if volume is None or volume <= 0:
+            return None
+        avail_vol = get_available_volume(market)
+        vol = min(volume, avail_vol)
+        vol = round_volume(vol)
+        if vol <= 0:
+            return None
+        if limit_price * vol < MINIMUM_ORDER_KRW:
+            return None
+        try:
+            rate_limit()
+            res = upbit.sell_limit_order(market, limit_price, vol)
         except Exception as e:
-            logger.error(f"[Error] 매수 실패 ({market}): {e}")
-            send_slack_message(f"[Error] 매수 실패: {e} for {market}")
+            logger.warning(f"sell_limit_order failed: {e}")
+            return None
+        if not res or "uuid" not in res:
+            return None
 
-# 전역 변수 선언 (코드 상단에 추가)
-highest_prices = {}  # 각 코인별 최고가 저장용
+        uuid = res["uuid"]
+        t0 = time.time()
+        base = cur0
+        while time.time() - t0 < timeout_sec and not stop_trading.is_set():
+            try:
+                rate_limit()
+                od = upbit.get_order(uuid)
+                remain_vol = float(od.get("remaining_volume", 0) or 0)
+                state = od.get("state", "")
+                cur2 = get_current_price_safe(market)
+                if not np.isnan(cur2) and base > 0:
+                    move = abs((cur2 - base) / base) * 100
+                    if move >= fast_move_pct:
+                        try: upbit.cancel_order(uuid)
+                        except Exception: pass
+                        slip = ((limit_price - cur2) / limit_price) * 100
+                        if slip > max_slip_pct:
+                            send_slack_message(f"[경고] {market} 매도 슬리피지 {slip:.2f}% > {max_slip_pct:.2f}% → 주문 취소")
+                            return None
+                        return upbit.sell_market_order(market, remain_vol)
+                if state == "done" or remain_vol <= 1e-12:
+                    return od
+            except Exception as e:
+                logger.warning(f"monitor order {uuid} failed: {e}")
+            time.sleep(2)
 
-def should_trail_stop(highest_price, current_price, trailing_percent=3.0):
-    decline = ((highest_price - current_price) / highest_price) * 100
-    return decline >= trailing_percent
+        try:
+            upbit.cancel_order(uuid)
+        except Exception:
+            pass
+        cur3 = get_current_price_safe(market)
+        slip = ((limit_price - cur3) / limit_price) * 100 if (not np.isnan(cur3) and limit_price > 0) else 0
+        if slip > max_slip_pct:
+            send_slack_message(f"[경고] {market} 매도 슬리피지 {slip:.2f}% > {max_slip_pct:.2f}% → 주문 취소")
+            return None
+        return upbit.sell_market_order(market, vol)
 
-def should_clear_inefficient_positions(df_1m, minutes_idle=180):
-    if len(df_1m) < minutes_idle:
+# ================== 트레이딩 로직 ==================
+def _risk_budget_krw(entry_price: float, atr_val: float) -> float:
+    equity = portfolio_value_krw()
+    risk_budget = equity * RISK_PER_TRADE
+    stop_pct = abs(FIXED_STOP_LOSS) / 100.0
+    dist = max(entry_price * stop_pct, atr_val * ATR_SL_MULT)
+    if dist <= 0:
+        return MIN_BUY_KRW
+    # 금액 = 위험예산 * (entry / dist)
+    amount = risk_budget * (entry_price / dist)
+    return max(MIN_BUY_KRW, min(amount, MAX_BUY_KRW))
+
+def _update_daily_dd_and_maybe_stop():
+    global day_start_equity, day_of_snapshot
+    today = time.strftime("%Y-%m-%d")
+    if day_of_snapshot != today:
+        day_of_snapshot = today
+        day_start_equity = portfolio_value_krw()
+        send_slack_message(f"[Daily Reset] 기준 에쿼티: {day_start_equity:,.0f} KRW")
+        return
+    eq = portfolio_value_krw()
+    if day_start_equity > 0:
+        dd = (eq - day_start_equity) / day_start_equity * 100.0
+        if dd <= -DAILY_MAX_DRAWDOWN_PCT and not stop_trading.is_set():
+            send_slack_message(f"[중지] 일간 드로우다운 {dd:.2f}% ≤ -{DAILY_MAX_DRAWDOWN_PCT:.2f}%")
+            stop_trading.set()
+
+def track_buy_signals(universe: List[str]):
+    global last_buy_time, buy_prices, highest_prices, position_meta
+    owned = owned_markets()
+    if len(owned) >= MAX_CONCURRENT_TRADES:
+        return
+    krw = get_available_krw()
+    if krw < MINIMUM_ORDER_KRW:
+        return
+    pv = portfolio_value_krw()
+    regime = btc_regime_factor()
+    base_target = pv * PORTFOLIO_BUY_RATIO
+    for m in universe:
+        if m in owned and owned[m] * get_current_price_safe(m) > pv * 0.25:
+            continue
+        if m in last_buy_time and time.time() - last_buy_time[m] < COOLDOWN_PERIOD_BUY:
+            continue
+        if m in last_loss_time and time.time() - last_loss_time[m] < COOLDOWN_AFTER_LOSS_SEC:
+            continue
+        sp = get_orderbook_spread_pct(m)
+        if sp > SPREAD_MAX_PCT:
+            continue
+
+        df3 = add_indicators(get_ohlcv(m, "3m", 200))
+        df15 = add_indicators(get_ohlcv(m, "15m", 200))
+        if df3.empty or df15.empty or len(df3) < 3:
+            continue
+
+        cur = float(safe_val(df3, "trade_price", -1, np.nan))
+        prev = float(safe_val(df3, "trade_price", -2, np.nan))
+        if np.isnan(cur) or np.isnan(prev) or prev <= 0:
+            continue
+        chg1 = (cur - prev) / prev * 100
+
+        rsi = float(safe_val(df3, "rsi", -1, np.nan))
+        macd_now = float(safe_val(df3, "macd", -1, np.nan))
+        macd_sig_now = float(safe_val(df3, "macd_signal", -1, np.nan))
+        macd_prev = float(safe_val(df3, "macd", -2, np.nan))
+        sig_prev = float(safe_val(df3, "macd_signal", -2, np.nan))
+        golden = (macd_now > macd_sig_now) and (macd_prev <= sig_prev)
+
+        ema20_3 = float(safe_val(df3, "ema20", -1, np.nan))
+        ema20_prev = float(safe_val(df3, "ema20", -2, np.nan))
+        ema_break = (prev < ema20_prev) and (cur > ema20_3)
+
+        st15 = bool(safe_val(df15, "supertrend", -1, False))
+        ema20_15 = float(safe_val(df15, "ema20", -1, np.nan))
+        ema50_15 = float(safe_val(df15, "ema50", -1, np.nan))
+        higher_ok = st15 or (ema20_15 > ema50_15)
+
+        in_bull_fvg = bool(safe_val(df3, "in_bull_fvg", -1, False))
+        ls_down = bool(safe_val(df3, "liquidity_sweep_down", -1, False))
+        discount_zone = bool(safe_val(df3, "discount_zone", -1, False))
+        in_ote = bool(safe_val(df3, "in_ote_long", -1, False))
+        ict_confluence = (in_bull_fvg or ls_down) and (discount_zone or in_ote)
+
+        if not np.isnan(rsi) and rsi > RSI_MAX_ENTRY:
+            continue
+        if chg1 > CHASE_UP_PCT_BLOCK:
+            continue
+
+        momentum_ok = golden or (ema_break and (rsi >= 35) and (rsi <= RSI_MAX_ENTRY))
+        buy_ok = momentum_ok and higher_ok and ict_confluence
+        if not buy_ok:
+            continue
+
+        atr_val = float(safe_val(df3, "atr", -1, np.nan))
+        if np.isnan(atr_val) or atr_val <= 0:
+            atr_val = cur * 0.01  # fallback
+
+        # 리스크 기반 금액
+        risk_amount = _risk_budget_krw(cur, atr_val)
+        # 레짐 감쇠 및 포트폴리오 상한 반영
+        target_amt = max(MIN_BUY_KRW, min(MAX_BUY_KRW, min(base_target, risk_amount) * regime))
+        target_amt = min(target_amt, krw)
+        if target_amt < MINIMUM_ORDER_KRW:
+            continue
+
+        limit_px = round_to_tick(cur * (1 + LIMIT_OFFSET_BUY))
+        res = place_limit_then_maybe_market("bid", m, krw_amount=target_amt, limit_price=limit_px)
+        if not res or "uuid" not in res:
+            continue
+
+        vwap, filled = get_order_fills(res["uuid"])
+        if filled <= 0 or np.isnan(vwap):
+            _, new_avg = get_balance(m)
+            entry = new_avg if new_avg > 0 else cur
+        else:
+            entry = float(vwap)
+
+        last_buy_time[m] = time.time()
+        buy_prices[m] = entry
+        highest_prices[m] = cur
+
+        # 초기 리스크 거리/스톱, TP 플래그
+        stop_pct = abs(FIXED_STOP_LOSS)/100.0
+        init_dist = max(entry * stop_pct, atr_val * ATR_SL_MULT)
+        position_meta[m] = {
+            "entry": entry,
+            "init_dist": init_dist,
+            "tp1": 0.0,
+            "tp2": 0.0,
+            "tp1_done": 0.0,
+            "tp2_done": 0.0,
+            "entered_at": time.time(),
+            "stop": max(0.0, entry - init_dist)  # 초기 스톱
+        }
+
+        slip_report = ""
+        if limit_px > 0:
+            slip = ((entry - limit_px) / limit_px) * 100
+            slip_report = f" / 슬리피지:{slip:.2f}%"
+        send_slack_message(f"[매수] {m} / 금액: {target_amt:.0f} KRW / 체결가(VWAP): {entry:.2f}{slip_report} / ICT FVG:{in_bull_fvg} OTE:{in_ote} Dsc:{discount_zone} / 리스크:{init_dist:.4f}")
+
+def should_trail_stop(high: float, cur: float, pct: float) -> bool:
+    if high <= 0 or np.isnan(high) or np.isnan(cur):
         return False
-    recent_range = df_1m["high_price"].iloc[-minutes_idle:].max() - df_1m["low_price"].iloc[-minutes_idle:].min()
-    avg_price = df_1m["trade_price"].iloc[-1]
-    volatility = (recent_range / avg_price) * 100
-    return volatility < 1.5
+    drop = (high - cur) / high * 100
+    return drop >= pct
+
+def _maybe_be_move(market: str, cur: float):
+    meta = position_meta.get(market)
+    if not meta: return
+    if meta.get("tp1_done", 0.0) and cur > 0:
+        be_price = meta["entry"] * (1.0 + BREAK_EVEN_BUFFER_PCT/100.0 + FEE_RATE*2)
+        meta["stop"] = max(meta.get("stop", 0.0), be_price)
+
+def _r_multiples(meta: Dict[str, float], cur: float) -> float:
+    if not meta: return 0.0
+    R = meta["init_dist"]
+    if R <= 0: return 0.0
+    return (cur - meta["entry"]) / R
 
 def track_sell_signals():
-    global total_profit, last_sell_signal_check, highest_prices
-    current_time = time.time()
-
-    if current_time - last_sell_signal_check >= SELL_SIGNAL_CHECK_INTERVAL:
-        owned_coins = get_owned_coins()
-        if owned_coins:
-            logger.info(f"[Info] Tracking sell signals for owned coins: {list(owned_coins.keys())}")
-        else:
-            logger.info("[Info] No coins owned. Sell signal tracking is active.")
-        last_sell_signal_check = current_time
-
-    balances = upbit.get_balances()
-    for balance in balances:
-        if balance['currency'] == 'KRW':
-            continue
-
-        market = f"KRW-{balance['currency']}"
-        volume = float(balance['balance'])
-        avg_buy_price = float(balance.get('avg_buy_price', 0))
-
-        if volume * avg_buy_price < MINIMUM_EVALUATION_KRW:
-            continue
-
-        multi_timeframe_dfs = get_candles_minutes_multiple(market, units=[1, 60])
-        df_1m = multi_timeframe_dfs.get(1)
-        df_60m = multi_timeframe_dfs.get(60)
-
-        if df_1m is None or df_60m is None or df_1m.empty or df_60m.empty:
-            continue
-        if df_1m.isnull().values.any() or df_60m.isnull().values.any():
-            continue
-
-        current_price = df_1m["trade_price"].iloc[-1]
-
-        if market not in highest_prices:
-            highest_prices[market] = current_price
-        else:
-            highest_prices[market] = max(highest_prices[market], current_price)
-
-        atr_1m = df_1m["atr"].iloc[-1]
-        supertrend_1m = df_1m["supertrend"].iloc[-1]
-        supertrend_prev_1m = df_1m["supertrend"].iloc[-2]
-        rsi_1m = df_1m["rsi"].iloc[-1]
-        macd_1m = df_1m["macd"].iloc[-1]
-        macd_signal_1m = df_1m["macd_signal"].iloc[-1]
-        bearish_ob = df_1m['bearish_ob'].iloc[-1]
-        liquidity_sweep_up = df_1m['liquidity_sweep_up'].iloc[-1]
-        mss_bearish = df_1m['mss_bearish'].iloc[-1]
-        fvg = df_1m['fvg'].iloc[-1]
-
-        profit_loss_ratio = ((current_price - avg_buy_price) / avg_buy_price) * 100
-        sell_condition_met = False
-        sell_volume_ratio = 1.0
-
-        if not np.isnan(atr_1m) and (avg_buy_price - current_price) > (atr_1m * 2.0):
-            send_slack_message(f"[Sell SL (ATR)] {market} 손실: {profit_loss_ratio:.2f}%")
-            sell_condition_met = True
-        elif profit_loss_ratio <= -5.0:
-            send_slack_message(f"[Sell SL (Fixed)] {market} 손실: {profit_loss_ratio:.2f}%")
-            sell_condition_met = True
-        elif not np.isnan(atr_1m) and (current_price - avg_buy_price) > (atr_1m * 3.0):
-            send_slack_message(f"[Sell TP (ATR)] {market} 이익: {profit_loss_ratio:.2f}%")
-            sell_condition_met = True
-            sell_volume_ratio = 0.5
-        elif profit_loss_ratio >= 10.0:
-            send_slack_message(f"[Sell TP (Fixed)] {market} 이익: {profit_loss_ratio:.2f}%")
-            sell_condition_met = True
-            sell_volume_ratio = 0.5
-        elif supertrend_prev_1m and not supertrend_1m:
-            send_slack_message(f"[Supertrend Flip] {market}")
-            sell_condition_met = True
-            sell_volume_ratio = 0.7
-        elif macd_1m < macd_signal_1m and df_1m["macd"].iloc[-2] > df_1m["macd_signal"].iloc[-2]:
-            send_slack_message(f"[MACD Death Cross] {market}")
-            sell_condition_met = True
-            sell_volume_ratio = 0.5
-        elif rsi_1m > 70 and df_1m["rsi"].iloc[-2] > rsi_1m:
-            send_slack_message(f"[RSI Overbought Drop] {market}")
-            sell_condition_met = True
-            sell_volume_ratio = 0.3
-        elif bearish_ob and (liquidity_sweep_up or fvg) and mss_bearish:
-            send_slack_message(f"[ICT Bearish Combo] {market}")
-            sell_condition_met = True
-            sell_volume_ratio = 1.0
-        elif should_trail_stop(highest_prices[market], current_price):
-            send_slack_message(f"[Trailing Stop] {market} 고점대비 하락으로 매도")
-            sell_condition_met = True
-            sell_volume_ratio = 1.0
-        elif should_clear_inefficient_positions(df_1m):
-            send_slack_message(f"[Low Volatility] {market} 정체 → 매도")
-            sell_condition_met = True
-            sell_volume_ratio = 1.0
-
-        if sell_condition_met:
-            trade_volume = volume * sell_volume_ratio
-            if trade_volume * current_price < MINIMUM_ORDER_KRW:
-                continue
-
-            order = place_market_order("ask", market, volume=trade_volume)
-            if order:
-                order_uuid = order.get('uuid')
-                if order_uuid == 'immediate_execution':
-                    executed_volume = float(order.get('executed_volume', 0))
-                    executed_price = float(order.get('price', current_price))
-                    profit = (executed_price - avg_buy_price) * executed_volume
-                    total_profit += profit
-                    send_slack_message(f"[Sell Done] {market} 수익: {profit:.2f} KRW, 총 수익: {total_profit:.2f}")
-                else:
-                    time.sleep(5)
-                    order_info = get_order(order_uuid)
-                    if order_info and isinstance(order_info, dict) and order_info.get('state') == 'done':
-                        executed_price = float(order_info.get('price', current_price))
-                        executed_volume = float(order_info['executed_volume'])
-                        profit = (executed_price - avg_buy_price) * executed_volume
-                        total_profit += profit
-                        send_slack_message(f"[Sell Done] {market} 수익: {profit:.2f} KRW, 총 수익: {total_profit:.2f}")
-
-# ===== Slack 명령 처리 =====
-# def handle_slack_commands():
-#     """Slack 명령어 처리 (Poll 방식, 실제 Slack Bot으로 전환 권장)"""
-#     # 이 부분은 실제 슬랙 봇 API (Slack Events API)를 사용하는 것이 더 효율적입니다.
-#     # 현재는 단순하게 웹훅을 통해 메시지를 확인하는 방식이므로, 실제 사용에는 한계가 있습니다.
-#     # 슬랙 봇을 사용하면 특정 채널에서 특정 명령어를 실시간으로 수신할 수 있습니다.
-#     logger.info("Starting Slack command handler thread.")
-#     while not stop_trading.is_set():
-#         try:
-#             # Slack 웹훅은 메시지를 보내는 용도이므로, 명령어를 받는 데는 적합하지 않습니다.
-#             # 실제로는 Slack Events API를 사용하여 특정 채널의 메시지를 리슨해야 합니다.
-#             # 이 예시에서는 "stop trading" 메시지가 어떻게든 수신된다고 가정하고 처리합니다.
-#             # (이 부분은 사용자 환경에 맞게 직접 구현이 필요합니다.)
-#             # 임시로 더미 로직 또는 수동 테스트를 위한 메시지 확인 로직을 유지
-#             # send_slack_message("[Info] Slack command handler is active. Send 'stop trading' to stop.") # 너무 자주 보내지 않도록 주석 처리
-
-#             # 임시: 로컬에서 파일로 명령을 읽는 방식 등 고려 가능
-#             # if os.path.exists("stop_command.txt"):
-#             #     with open("stop_command.txt", "r") as f:
-#             #         command = f.read().strip().lower()
-#             #         if "stop trading" in command:
-#             #             send_slack_message("[Command Received] Stopping trading bot.")
-#             #             os.remove("stop_command.txt")
-#             #             os.kill(os.getpid(), signal.SIGTERM)
-
-#         except Exception as e:
-#             logger.error(f"Error in Slack command handler: {e}")
-#         time.sleep(5) # 5초마다 확인 (폴링 방식)
-
-# Slack 명령은 Events API 또는 파일 기반 감지로 처리 필요
-def handle_slack_commands():
-    while not stop_trading.is_set():
-        if os.path.exists("stop_command.txt"):
-            with open("stop_command.txt", "r") as f:
-                if "stop trading" in f.read().lower():
-                    send_slack_message("[Command Received] Stopping trading bot.")
-                    os.kill(os.getpid(), signal.SIGTERM)
-        time.sleep(5)
-
-def main():
-    if not ACCESS_KEY or not SECRET_KEY:
-        logger.error("ACCESS_KEY or SECRET_KEY is not set in environment variables.")
-        send_slack_message("[Error] Upbit API keys are not configured. Exiting.")
+    global total_profit, highest_prices, position_meta, last_loss_time
+    owned = owned_markets()
+    if not owned:
         return
 
-    send_slack_message("[Start] Automated trading bot initiated.")
+    for m, vol in owned.items():
+        df3 = add_indicators(get_ohlcv(m, "3m", 200))
+        if df3.empty or len(df3) < 3:
+            continue
+
+        cur = float(safe_val(df3, "trade_price", -1, np.nan))
+        if np.isnan(cur):
+            continue
+
+        avg = float(buy_prices.get(m, 0) or 0)
+        if avg <= 0:
+            _, avg2 = get_balance(m)
+            avg = avg2 if avg2 > 0 else cur
+
+        if m not in highest_prices or np.isnan(highest_prices[m]):
+            highest_prices[m] = cur
+        else:
+            highest_prices[m] = max(highest_prices[m], cur)
+
+        pnl_pct = (cur - avg) / avg * 100 if avg > 0 else 0.0
+        atr = float(safe_val(df3, "atr", -1, np.nan))
+        st_now = bool(safe_val(df3, "supertrend", -1, False))
+        st_prev = bool(safe_val(df3, "supertrend", -2, False))
+        macd = float(safe_val(df3, "macd", -1, np.nan))
+        macd_sig = float(safe_val(df3, "macd_signal", -1, np.nan))
+        macd_prev = float(safe_val(df3, "macd", -2, np.nan))
+        sig_prev = float(safe_val(df3, "macd_signal", -2, np.nan))
+        death = (macd < macd_sig) and (macd_prev >= sig_prev)
+
+        in_bear_fvg = bool(safe_val(df3, "in_bear_fvg", -1, False))
+        ls_up = bool(safe_val(df3, "liquidity_sweep_up", -1, False))
+        premium_zone = bool(safe_val(df3, "premium_zone", -1, False))
+        ict_bearish = (in_bear_fvg and premium_zone) or ls_up
+
+        meta = position_meta.get(m, None)
+        if meta:
+            # BE 이동 체크
+            _maybe_be_move(m, cur)
+            # 스톱 히트 여부
+            stop_line = meta.get("stop", 0.0)
+            if stop_line > 0 and cur <= stop_line:
+                qty = vol
+                if qty * cur >= MINIMUM_ORDER_KRW:
+                    limit_px = round_to_tick(cur * (1 + LIMIT_OFFSET_SELL))
+                    res = place_limit_then_maybe_market("ask", m, limit_price=limit_px, volume=qty)
+                    if res and "uuid" in res:
+                        vwap, filled = get_order_fills(res["uuid"])
+                        exec_qty = filled if filled > 0 else qty
+                        exec_price = float(vwap) if (filled > 0 and not np.isnan(vwap)) else cur
+                        profit = (exec_price - avg) * exec_qty
+                        total_profit += profit
+                        if profit < 0:
+                            last_loss_time[m] = time.time()
+                        send_slack_message(f"[스톱] {m} / {exec_qty:.6f}@{exec_price:.2f} / PnL:{profit:.0f} / 누적:{total_profit:.0f}")
+                        position_meta.pop(m, None)
+                        continue
+
+        sell = False
+        ratio = 1.0
+        reason = ""
+
+        if not np.isnan(atr) and (avg - cur) > atr * ATR_SL_MULT:
+            sell, ratio, reason = True, 1.0, f"ATR 손절({pnl_pct:.2f}%)"
+        elif pnl_pct <= FIXED_STOP_LOSS:
+            sell, ratio, reason = True, 1.0, f"고정 손절({pnl_pct:.2f}%)"
+
+        else:
+            # R 기반 부분익절
+            if meta:
+                r_mult = _r_multiples(meta, cur)
+                if (not meta.get("tp1_done")) and r_mult >= TP1_R:
+                    sell, ratio, reason = True, 0.5, f"1R 부분익절({pnl_pct:.2f}%)"
+                    meta["tp1_done"] = 1.0
+                    # BE 이동 트리거
+                    _maybe_be_move(m, cur)
+                elif (not meta.get("tp2_done")) and r_mult >= TP2_R:
+                    sell, ratio, reason = True, 0.5, f"2R 추가익절({pnl_pct:.2f}%)"
+                    meta["tp2_done"] = 1.0
+
+        if not sell:
+            # 추세 반전/모멘텀 약화
+            if st_prev and not st_now:
+                sell, ratio, reason = True, 0.7, "Supertrend 반전"
+            elif death:
+                sell, ratio, reason = True, 0.5, "MACD 데드크로스"
+            elif ict_bearish:
+                sell, ratio, reason = True, 1.0, "ICT 베어리시"
+            elif should_trail_stop(highest_prices[m], cur, TRAILING_STOP_PCT):
+                sell, ratio, reason = True, 1.0, "트레일링 스탑"
+
+        if not sell:
+            continue
+
+        qty = vol * ratio
+        if qty * cur < MINIMUM_ORDER_KRW:
+            continue
+
+        limit_px = round_to_tick(cur * (1 + LIMIT_OFFSET_SELL))
+        res = place_limit_then_maybe_market("ask", m, limit_price=limit_px, volume=qty)
+        if not res or "uuid" not in res:
+            continue
+
+        vwap, filled = get_order_fills(res["uuid"])
+        exec_qty = filled if filled > 0 else qty
+        exec_price = float(vwap) if (filled > 0 and not np.isnan(vwap)) else cur
+
+        profit = (exec_price - avg) * exec_qty
+        total_profit += profit
+        if profit < 0:
+            last_loss_time[m] = time.time()
+
+        slip_report = ""
+        if limit_px > 0:
+            slip = ((limit_px - exec_price) / limit_px) * 100
+            slip_report = f" / 슬리피지:{slip:.2f}%"
+        send_slack_message(f"[매도] {m} / 수량:{exec_qty:.6f} / 체결가(VWAP):{exec_price:.2f} / PnL:{profit:.0f} KRW / 누적:{total_profit:.0f} KRW / 사유:{reason}{slip_report}")
+
+        # 전량 청산된 경우 메타 제거
+        bal_after, _ = get_balance(m)
+        if bal_after * exec_price < MINIMUM_EVALUATION_KRW:
+            position_meta.pop(m, None)
+
+# ================== Slack 간이 명령 ==================
+def handle_slack_commands():
+    while not stop_trading.is_set():
+        try:
+            if os.path.exists("stop_command.txt"):
+                with open("stop_command.txt", "r") as f:
+                    if "stop trading" in f.read().lower():
+                        send_slack_message("[명령] 중지 요청 수신")
+                        os.kill(os.getpid(), signal.SIGTERM)
+        except Exception:
+            pass
+        time.sleep(5)
+
+# ================== 메인 ==================
+def main():
+    global upbit
+    if not ACCESS_KEY or not SECRET_KEY:
+        logger.error("API 키가 설정되지 않았습니다.")
+        print("API 키가 설정되지 않았습니다.")
+        return
+
+    upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
     signal.signal(signal.SIGINT, handle_stop_signal)
     signal.signal(signal.SIGTERM, handle_stop_signal)
 
+    send_slack_message("[Start] Upbit 자동매매 시작")
     initialize_trading_data()
+    start_report_thread()
 
-    start_report_thread()  # ← 리포트 쓰레드 시작
+    threading.Thread(target=handle_slack_commands, daemon=True).start()
 
-    # Slack 명령 처리 쓰레드 시작 (데몬 쓰레드로 메인 프로그램 종료 시 함께 종료)
-    slack_thread = threading.Thread(target=handle_slack_commands, daemon=True)
-    slack_thread.start()
+    last_universe_refresh = 0
+    universe: List[str] = []
 
-    logger.info("Starting main trading loop.")
     while not stop_trading.is_set():
         try:
-            track_buy_signals()
-            track_sell_signals()
-        except Exception as e:
-            logger.error(f"Error in main trading loop: {e}", exc_info=True)
-            send_slack_message(f"[Critical Error] Main trading loop error: {e}. Check logs.")
-        time.sleep(INTERVAL) # 설정된 INTERVAL마다 실행
+            _update_daily_dd_and_maybe_stop()
+            if stop_trading.is_set():
+                break
 
-    logger.info("Main trading loop finished.")
+            if time.time() - last_universe_refresh > 600 or not universe:
+                universe = pick_universe_by_krw_volume()
+                last_universe_refresh = time.time()
+                logger.info(f"Universe refreshed: {universe[:10]} ...")
+
+            track_buy_signals(universe)
+            track_sell_signals()
+
+        except Exception as e:
+            logger.error(f"main loop error: {e}", exc_info=True)
+            send_slack_message(f"[오류] 메인 루프 예외: {e}")
+
+        time.sleep(INTERVAL)
 
 if __name__ == "__main__":
     main()
