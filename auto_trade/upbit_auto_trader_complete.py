@@ -44,6 +44,9 @@ last_loss_time: Dict[str, float] = {}
 day_start_equity: float = 0.0
 day_of_snapshot: str = ""
 
+# 주봉 일목구름 상태 캐시: { market: (timestamp, state_dict) }
+weekly_ich_cache: Dict[str, Tuple[float, Dict[str, bool]]] = {}
+
 # ================== 파라미터 ==================
 INTERVAL = 10
 REQUEST_LIMIT_PER_SECOND = 5
@@ -54,7 +57,7 @@ COOLDOWN_PERIOD_BUY = 60
 COOLDOWN_AFTER_LOSS_SEC = 900
 
 MAX_CONCURRENT_TRADES = 10
-TOP_VOLUME_POOL = 100
+TOP_VOLUME_POOL = 100  # 현재는 사용하지 않지만, 필요시 상위 N개로 제한할 때 활용 가능
 PORTFOLIO_BUY_RATIO = 0.30
 MIN_BUY_KRW = 6000
 MAX_BUY_KRW = 3_000_000
@@ -62,8 +65,8 @@ MAX_BUY_KRW = 3_000_000
 CHASE_UP_PCT_BLOCK = 15.0
 RSI_MAX_ENTRY = 90
 
-FIXED_STOP_LOSS = -3.0          
-FIXED_TAKE_PROFIT = 7           
+FIXED_STOP_LOSS = -3.0          # -3% 손절
+FIXED_TAKE_PROFIT = 7           # +7% 고정 익절 (현재는 R 베이스와 병행)
 ATR_TP_MULT = 3
 ATR_SL_MULT = 1.5
 TRAILING_STOP_PCT = 2.5
@@ -125,7 +128,11 @@ def get_markets_krw() -> List[str]:
         logger.error(f"get_tickers failed: {e}")
         return []
 
-def get_ohlcv(market: str, interval: str = "1m", count: int = 200) -> pd.DataFrame:
+def get_ohlcv(market: str, interval: str = "minute1", count: int = 200) -> pd.DataFrame:
+    """
+    pyupbit.get_ohlcv 래퍼
+    interval 예시: "minute1", "minute15", "minute60", "minute240", "day", "week", "month"
+    """
     try:
         rate_limit()
         df = pyupbit.get_ohlcv(market, interval=interval, count=count)
@@ -164,14 +171,17 @@ def get_orderbook_spread_pct(market: str) -> float:
     try:
         rate_limit()
         ob = pyupbit.get_orderbook(tickers=market)
-        if not ob: return np.inf
+        if not ob:
+            return np.inf
         unit = ob[0]
         bids = unit.get("orderbook_units", [])
-        if not bids: return np.inf
+        if not bids:
+            return np.inf
         best_ask = float(bids[0]["ask_price"])
         best_bid = float(bids[0]["bid_price"])
         mid = (best_ask + best_bid) / 2.0
-        if mid <= 0: return np.inf
+        if mid <= 0:
+            return np.inf
         return (best_ask - best_bid) / mid * 100.0
     except Exception:
         return np.inf
@@ -351,7 +361,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 # ====== ICHIMOKU UTILS ======
 def add_ichimoku(df: pd.DataFrame) -> pd.DataFrame:
-    """주봉 일목구름 계산 유틸 (클라우드 및 돌파/이탈 플래그 생성)."""
+    """일목구름 계산 유틸 (클라우드 및 돌파/이탈 플래그 생성)."""
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
@@ -360,10 +370,9 @@ def add_ichimoku(df: pd.DataFrame) -> pd.DataFrame:
     low = df["low_price"]
     close = df["trade_price"]
 
-    # 기본 일목 구성요소
-    conversion = (high.rolling(9).max() + low.rolling(9).min()) / 2.0      # 전환선(9)
-    base = (high.rolling(26).max() + low.rolling(26).min()) / 2.0          # 기준선(26)
-    span_a = ((conversion + base) / 2.0).shift(26)                          # 선행스팬 A
+    conversion = (high.rolling(9).max() + low.rolling(9).min()) / 2.0  # 전환선(9)
+    base = (high.rolling(26).max() + low.rolling(26).min()) / 2.0      # 기준선(26)
+    span_a = ((conversion + base) / 2.0).shift(26)                     # 선행스팬 A
     span_b = ((high.rolling(52).max() + low.rolling(52).min()) / 2.0).shift(26)  # 선행스팬 B
 
     df["ich_span_a"] = span_a
@@ -393,25 +402,51 @@ def add_ichimoku(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def get_weekly_ichimoku_state(market: str) -> Dict[str, bool]:
+def get_weekly_ichimoku_state(market: str, max_age_sec: int = 1800) -> Dict[str, bool]:
     """
-    주봉 일목구름 상태 요약:
+    주봉 일목구름 상태 요약 + 유효성 플래그:
+      - valid: 주봉 캔들이 충분하고 일목구름(Span A/B)이 형성되어 있는지 여부
       - trend_ok: 종가가 클라우드 위에 위치 (롱 사이드만 허용)
       - breakout_up: 직전 구간 대비 클라우드 상방 돌파
       - breakdown: 클라우드 위에서 그려지다가 클라우드 안/아래로 재진입
-    """
-    dfw = get_ohlcv(market, interval="week", count=120)
-    dfw = add_ichimoku(dfw)
-    if dfw is None or dfw.empty:
-        return {"trend_ok": False, "breakout_up": False, "breakdown": False}
 
-    if len(dfw) < 3:
-        last = dfw.iloc[-1]
-        trend_ok = bool(last.get("ich_above_cloud", False))
-        return {"trend_ok": trend_ok, "breakout_up": False, "breakdown": False}
+    상장한지 얼마 안되었거나 클라우드가 형성되지 않은 경우 valid=False 로 반환하고,
+    이 경우 해당 종목은 매수/매도 모두 진행하지 않는다.
+    """
+    default_state = {
+        "valid": False,
+        "trend_ok": False,
+        "breakout_up": False,
+        "breakdown": False,
+    }
+
+    now = time.time()
+    cached = weekly_ich_cache.get(market)
+    if cached is not None:
+        ts, state = cached
+        if now - ts < max_age_sec:
+            return state
+
+    dfw = get_ohlcv(market, interval="week", count=120)
+    if dfw is None or dfw.empty:
+        weekly_ich_cache[market] = (now, default_state)
+        return default_state
+
+    dfw = add_ichimoku(dfw)
+    if dfw is None or dfw.empty or len(dfw) < 3:
+        weekly_ich_cache[market] = (now, default_state)
+        return default_state
 
     last = dfw.iloc[-1]
     prev = dfw.iloc[-2]
+
+    span_a = last.get("ich_span_a")
+    span_b = last.get("ich_span_b")
+
+    # 일목구름이 아직 형성되지 않은 경우 (Span A/B 가 NaN 이면 유효하지 않은 상태로 본다)
+    if pd.isna(span_a) or pd.isna(span_b):
+        weekly_ich_cache[market] = (now, default_state)
+        return default_state
 
     trend_ok = bool(last.get("ich_above_cloud", False))
     breakout_up = bool(last.get("ich_breakout_up", False)) or (
@@ -419,28 +454,38 @@ def get_weekly_ichimoku_state(market: str) -> Dict[str, bool]:
     )
     breakdown = bool(last.get("ich_breakdown_from_above", False))
 
-    return {
+    state = {
+        "valid": True,
         "trend_ok": trend_ok,
         "breakout_up": breakout_up,
         "breakdown": breakdown,
     }
+    weekly_ich_cache[market] = (now, state)
+    return state
 
 # ================== 스캐너/레짐 ==================
 def pick_universe_by_krw_volume() -> List[str]:
+    """
+    KRW 마켓 전체를 대상으로:
+      - 초저가 코인 배제(MIN_PRICE_KRW)
+      - 일단 일봉 기준으로 거래대금(가격*거래량) 정렬
+      - 스프레드 필터(SPREAD_MAX_PCT) 적용
+    """
     markets = get_markets_krw()
     scores = []
     for m in markets:
         df_day = get_ohlcv(m, interval="day", count=2)
-        if df_day.empty: continue
+        if df_day.empty:
+            continue
         last_price = float(safe_val(df_day, "trade_price", -1, 0))
         last_vol = float(safe_val(df_day, "candle_acc_trade_volume", -1, 0))
-        if last_price < MIN_PRICE_KRW:  # 초저가 배제
+        if last_price < MIN_PRICE_KRW:
             continue
         v_krw = last_vol * last_price
         scores.append((m, v_krw))
     scores.sort(key=lambda x: x[1], reverse=True)
-    top = [m for m, _ in scores[:TOP_VOLUME_POOL]]
-    # 스프레드 필터
+    # 볼륨 기준으로 정렬된 전체 KRW 마켓을 대상으로, 스프레드 필터만 적용
+    top = [m for m, _ in scores]
     filtered = []
     for m in top:
         sp = get_orderbook_spread_pct(m)
@@ -449,10 +494,11 @@ def pick_universe_by_krw_volume() -> List[str]:
     return filtered
 
 def btc_regime_factor() -> float:
-    """BTC 15m 상향(EMA20>EMA50 or Supertrend True)이면 1.0, 아니면 0.5."""
+    """BTC 15분봉 상향(EMA20>EMA50 or Supertrend True)이면 1.0, 아니면 0.5."""
     try:
-        df = add_indicators(get_ohlcv("KRW-BTC", "15m", 200))
-        if df.empty: return 1.0
+        df = add_indicators(get_ohlcv("KRW-BTC", "minute15", 200))
+        if df.empty:
+            return 1.0
         ema_ok = bool(safe_val(df, "ema20", -1, np.nan) > safe_val(df, "ema50", -1, np.nan))
         st_ok = bool(safe_val(df, "supertrend", -1, False))
         return 1.0 if (ema_ok or st_ok) else 0.5
@@ -469,9 +515,11 @@ def initialize_trading_data():
     valid = set(get_markets_krw())
     for b in balances:
         cur = b.get("currency")
-        if cur == "KRW": continue
+        if cur == "KRW":
+            continue
         m = f"KRW-{cur}"
-        if m not in valid: continue
+        if m not in valid:
+            continue
         avg = float(b.get("avg_buy_price", 0) or 0)
         if avg > 0:
             buy_prices[m] = avg
@@ -686,8 +734,10 @@ def place_limit_then_maybe_market(side: str, market: str, krw_amount: Optional[f
                         if not np.isnan(cur2) and base > 0:
                             move = abs((cur2 - base) / base) * 100
                             if move >= fast_move_pct:
-                                try: upbit.cancel_order(uuid)
-                                except Exception: pass
+                                try:
+                                    upbit.cancel_order(uuid)
+                                except Exception:
+                                    pass
                                 slip = ((cur2 - limit_price) / limit_price) * 100
                                 if slip > max_slip_pct:
                                     send_slack_message(f"[경고] {market} 매수 슬리피지 {slip:.2f}% > {max_slip_pct:.2f}% → 주문 취소")
@@ -767,8 +817,10 @@ def place_limit_then_maybe_market(side: str, market: str, krw_amount: Optional[f
                 if not np.isnan(cur2) and base > 0:
                     move = abs((cur2 - base) / base) * 100
                     if move >= fast_move_pct:
-                        try: upbit.cancel_order(uuid)
-                        except Exception: pass
+                        try:
+                            upbit.cancel_order(uuid)
+                        except Exception:
+                            pass
                         slip = ((limit_price - cur2) / limit_price) * 100
                         if slip > max_slip_pct:
                             send_slack_message(f"[경고] {market} 매도 슬리피지 {slip:.2f}% > {max_slip_pct:.2f}% → 주문 취소")
@@ -799,7 +851,6 @@ def _risk_budget_krw(entry_price: float, atr_val: float) -> float:
     dist = max(entry_price * stop_pct, atr_val * ATR_SL_MULT)
     if dist <= 0:
         return MIN_BUY_KRW
-    # 금액 = 위험예산 * (entry / dist)
     amount = risk_budget * (entry_price / dist)
     return max(MIN_BUY_KRW, min(amount, MAX_BUY_KRW))
 
@@ -831,13 +882,10 @@ def track_buy_signals(universe: List[str]):
     base_target = pv * PORTFOLIO_BUY_RATIO
 
     for m in universe:
-        # 이미 큰 비중 보유 시 추가 매수 제한
         if m in owned and owned[m] * get_current_price_safe(m) > pv * 0.25:
             continue
-        # 직전 매수 쿨다운
         if m in last_buy_time and time.time() - last_buy_time[m] < COOLDOWN_PERIOD_BUY:
             continue
-        # 직전 손실 후 쿨다운
         if m in last_loss_time and time.time() - last_loss_time[m] < COOLDOWN_AFTER_LOSS_SEC:
             continue
 
@@ -845,15 +893,18 @@ def track_buy_signals(universe: List[str]):
         if sp > SPREAD_MAX_PCT:
             continue
 
-        # 1순위 필터: 주봉 일목구름 (클라우드 위에 있는 종목만 롱 진입)
+        # 1순위 필터: 주봉 일목구름
+        #  - valid=False (상장 초기/클라우드 미형성) 인 종목은 매수 자체를 진행하지 않음
+        #  - trend_ok=True 인, 즉 주봉 종가가 클라우드 위에 있는 종목만 롱 진입
         ich_state = get_weekly_ichimoku_state(m)
+        if not ich_state.get("valid", False):
+            continue
         if not ich_state["trend_ok"]:
-            # 주봉이 클라우드 위가 아니면 매수하지 않음 (거시 추세 역행 방지)
             continue
 
         # 거시 타임프레임 기반 보조 지표 (4시간/1시간)
-        df4h = add_indicators(get_ohlcv(m, "240m", 200))
-        df1h = add_indicators(get_ohlcv(m, "60m", 200))
+        df4h = add_indicators(get_ohlcv(m, "minute240", 200))
+        df1h = add_indicators(get_ohlcv(m, "minute60", 200))
         if df4h.empty or df1h.empty or len(df4h) < 3 or len(df1h) < 3:
             continue
 
@@ -886,46 +937,37 @@ def track_buy_signals(universe: List[str]):
         in_ote_4h = bool(safe_val(df4h, "in_ote_long", -1, False))
 
         # 과한 단기 급등 & 과열 구간 필터 (거시 기준으로 완화)
-        # 1시간 단기 급등/과열 + 4시간 과열 모두 체크
         if (not np.isnan(rsi_1h) and rsi_1h > RSI_MAX_ENTRY) or (not np.isnan(rsi_4h) and rsi_4h > RSI_MAX_ENTRY - 5):
             continue
-        if chg1 > (CHASE_UP_PCT_BLOCK * 0.7):  # 초단기(3분) 대비 완화하되, 과도한 추격은 여전히 차단
+        if chg1 > (CHASE_UP_PCT_BLOCK * 0.7):
             continue
 
         # 보조 지표 기반 매수 로직 (거시 타임프레임 점수제)
         score = 0
-        # 4시간 모멘텀 (MACD 골든 or EMA20>EMA50)
         if golden_4h or ema_trend_4h:
             score += 1
-        # 4시간 추세 (Supertrend)
         if st4h:
             score += 1
-        # ICT 관점 유리 구간 (4시간 FVG, 유동성 스윕, 할인/OTE)
         if in_bull_fvg_4h or ls_down_4h or discount_zone_4h or in_ote_4h:
             score += 1
-        # 4시간 RSI가 무리 없는 매수 존일 때 (과도한 저점/고점 회피)
         if not np.isnan(rsi_4h) and 35 <= rsi_4h <= (RSI_MAX_ENTRY - 10):
             score += 1
 
-        # 기준 점수 이상 + 주봉 일목 추세 OK 일 때만 진입
         buy_ok = score >= 2
         if not buy_ok:
             continue
 
-        # 리스크 계산은 4시간 ATR 기준으로 (변동성을 주봉/일봉 보다 더 민감하게 반영)
+        # 리스크 계산은 4시간 ATR 기준
         atr_val = float(safe_val(df4h, "atr", -1, np.nan))
         if np.isnan(atr_val) or atr_val <= 0:
-            atr_val = cur * 0.02  # 4시간 기준 fallback (약 2%)
+            atr_val = cur * 0.02  # fallback 2%
 
-        # 리스크 기반 금액
         risk_amount = _risk_budget_krw(cur, atr_val)
-        # 레짐 감쇠 및 포트폴리오 상한 반영
         target_amt = max(MIN_BUY_KRW, min(MAX_BUY_KRW, min(base_target, risk_amount) * regime))
         target_amt = min(target_amt, krw)
         if target_amt < MINIMUM_ORDER_KRW:
             continue
 
-        # 기본은 지정가, 급격한 변동 시 place_limit_then_maybe_market 내부에서 시장가 전환
         limit_px = round_to_tick(cur * (1 + LIMIT_OFFSET_BUY))
         res = place_limit_then_maybe_market("bid", m, krw_amount=target_amt, limit_price=limit_px)
         if not res or "uuid" not in res:
@@ -942,7 +984,6 @@ def track_buy_signals(universe: List[str]):
         buy_prices[m] = entry
         highest_prices[m] = cur
 
-        # 초기 리스크 거리/스톱, TP 플래그 (4시간 ATR 기준)
         stop_pct = abs(FIXED_STOP_LOSS) / 100.0
         init_dist = max(entry * stop_pct, atr_val * ATR_SL_MULT)
         position_meta[m] = {
@@ -977,15 +1018,18 @@ def should_trail_stop(high: float, cur: float, pct: float) -> bool:
 
 def _maybe_be_move(market: str, cur: float):
     meta = position_meta.get(market)
-    if not meta: return
+    if not meta:
+        return
     if meta.get("tp1_done", 0.0) and cur > 0:
         be_price = meta["entry"] * (1.0 + BREAK_EVEN_BUFFER_PCT/100.0 + FEE_RATE*2)
         meta["stop"] = max(meta.get("stop", 0.0), be_price)
 
 def _r_multiples(meta: Dict[str, float], cur: float) -> float:
-    if not meta: return 0.0
+    if not meta:
+        return 0.0
     R = meta["init_dist"]
-    if R <= 0: return 0.0
+    if R <= 0:
+        return 0.0
     return (cur - meta["entry"]) / R
 
 def track_sell_signals():
@@ -995,14 +1039,16 @@ def track_sell_signals():
         return
 
     for m, vol in owned.items():
-        # 거시 타임프레임 기반 청산 판단 (4시간/1시간)
-        df4h = add_indicators(get_ohlcv(m, "240m", 200))
-        df1h = add_indicators(get_ohlcv(m, "60m", 200))
+        df4h = add_indicators(get_ohlcv(m, "minute240", 200))
+        df1h = add_indicators(get_ohlcv(m, "minute60", 200))
         if df4h.empty or len(df4h) < 3:
             continue
 
         # 주봉 일목구름 상태 (1순위 방향성 필터)
+        #  - valid=False (상장 초기/클라우드 미형성) 인 종목은 매수/매도 모두 건드리지 않음
         ich_state = get_weekly_ichimoku_state(m)
+        if not ich_state.get("valid", False):
+            continue
         ich_breakdown = ich_state.get("breakdown", False)
 
         # 가격은 가급적 더 민감한 1시간 봉에서 확인, 없으면 4시간 기준
@@ -1022,7 +1068,6 @@ def track_sell_signals():
 
         pnl_pct = (cur - avg) / avg * 100 if avg > 0 else 0.0
 
-        # 4시간 기준 ATR 및 추세/모멘텀
         atr = float(safe_val(df4h, "atr", -1, np.nan))
         st_now_4h = bool(safe_val(df4h, "supertrend", -1, False))
         st_prev_4h = bool(safe_val(df4h, "supertrend", -2, False))
@@ -1039,9 +1084,7 @@ def track_sell_signals():
 
         meta = position_meta.get(m, None)
         if meta:
-            # BE 이동 체크
             _maybe_be_move(m, cur)
-            # 스톱 히트 여부 (손절/익절 비율에 상관 없이 강제 청산)
             stop_line = meta.get("stop", 0.0)
             if stop_line > 0 and cur <= stop_line:
                 qty = vol
@@ -1064,18 +1107,17 @@ def track_sell_signals():
         ratio = 1.0
         reason = ""
 
-        # 1차 방어: ATR/고정 손절 (4시간 변동성 기준 강한 손절 시그널)
+        # 1차 방어: ATR/고정 손절
         if not np.isnan(atr) and (avg - cur) > atr * ATR_SL_MULT:
             sell, ratio, reason = True, 1.0, f"4h ATR 손절({pnl_pct:.2f}%)"
         elif pnl_pct <= FIXED_STOP_LOSS:
             sell, ratio, reason = True, 1.0, f"고정 손절({pnl_pct:.2f}%)"
 
-        # 2차: 주봉 일목구름 하락 시그널 (클라우드 위에서 안/아래로 재진입) → 전량 청산
+        # 2차: 주봉 일목구름 하락 시그널 → 전량 청산
         elif ich_breakdown:
             sell, ratio, reason = True, 1.0, "주봉 일목구름 하락(클라우드 재진입/하회)"
 
         else:
-            # 3차: R 기반 부분익절 로직 (거시 기준 비율은 동일)
             if meta:
                 r_mult = _r_multiples(meta, cur)
                 if (not meta.get("tp1_done")) and r_mult >= TP1_R:
@@ -1087,10 +1129,8 @@ def track_sell_signals():
                     meta["tp2_done"] = 1.0
 
         if not sell:
-            # 4차: 추세 반전/모멘텀 약화 및 ICT 시그널 (4시간 기준)
             strong_combo = ict_bearish_4h and (death_4h or (st_prev_4h and not st_now_4h))
             if strong_combo:
-                # 강한 복합 매도 시그널 → 전량 청산
                 sell, ratio, reason = True, 1.0, "강한 복합 매도 시그널(ICT+추세, 4h)"
             elif st_prev_4h and not st_now_4h:
                 sell, ratio, reason = True, 0.7, "4h Supertrend 반전"
@@ -1108,7 +1148,6 @@ def track_sell_signals():
         if qty * cur < MINIMUM_ORDER_KRW:
             continue
 
-        # 기본은 지정가, 급격한 변동 시 place_limit_then_maybe_market 내부에서 시장가 전환
         limit_px = round_to_tick(cur * (1 + LIMIT_OFFSET_SELL))
         res = place_limit_then_maybe_market("ask", m, limit_price=limit_px, volume=qty)
         if not res or "uuid" not in res:
@@ -1132,7 +1171,6 @@ def track_sell_signals():
             f"/ PnL:{profit:.0f} KRW / 누적:{total_profit:.0f} KRW / 사유:{reason}{slip_report}"
         )
 
-        # 전량 청산된 경우 메타 제거
         bal_after, _ = get_balance(m)
         if bal_after * exec_price < MINIMUM_EVALUATION_KRW:
             position_meta.pop(m, None)
