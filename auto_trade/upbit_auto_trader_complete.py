@@ -348,6 +348,83 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col].astype(bool)
     return df
 
+
+# ====== ICHIMOKU UTILS ======
+def add_ichimoku(df: pd.DataFrame) -> pd.DataFrame:
+    """주봉 일목구름 계산 유틸 (클라우드 및 돌파/이탈 플래그 생성)."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+
+    high = df["high_price"]
+    low = df["low_price"]
+    close = df["trade_price"]
+
+    # 기본 일목 구성요소
+    conversion = (high.rolling(9).max() + low.rolling(9).min()) / 2.0      # 전환선(9)
+    base = (high.rolling(26).max() + low.rolling(26).min()) / 2.0          # 기준선(26)
+    span_a = ((conversion + base) / 2.0).shift(26)                          # 선행스팬 A
+    span_b = ((high.rolling(52).max() + low.rolling(52).min()) / 2.0).shift(26)  # 선행스팬 B
+
+    df["ich_span_a"] = span_a
+    df["ich_span_b"] = span_b
+
+    cloud_high = np.maximum(span_a, span_b)
+    cloud_low = np.minimum(span_a, span_b)
+
+    above = (close > cloud_high) & span_a.notna() & span_b.notna()
+    below = (close < cloud_low) & span_a.notna() & span_b.notna()
+    inside = (~above & ~below) & span_a.notna() & span_b.notna()
+
+    df["ich_above_cloud"] = above
+    df["ich_below_cloud"] = below
+    df["ich_in_cloud"] = inside
+
+    prev_above = above.shift(1).fillna(False)
+    df["ich_breakout_up"] = above & (~prev_above)
+
+    now_not_above = ~above & (inside | below)
+    df["ich_breakdown_from_above"] = now_not_above & prev_above
+
+    for col in ["ich_above_cloud", "ich_below_cloud", "ich_in_cloud",
+                "ich_breakout_up", "ich_breakdown_from_above"]:
+        df[col] = df[col].astype(bool)
+
+    return df
+
+
+def get_weekly_ichimoku_state(market: str) -> Dict[str, bool]:
+    """
+    주봉 일목구름 상태 요약:
+      - trend_ok: 종가가 클라우드 위에 위치 (롱 사이드만 허용)
+      - breakout_up: 직전 구간 대비 클라우드 상방 돌파
+      - breakdown: 클라우드 위에서 그려지다가 클라우드 안/아래로 재진입
+    """
+    dfw = get_ohlcv(market, interval="week", count=120)
+    dfw = add_ichimoku(dfw)
+    if dfw is None or dfw.empty:
+        return {"trend_ok": False, "breakout_up": False, "breakdown": False}
+
+    if len(dfw) < 3:
+        last = dfw.iloc[-1]
+        trend_ok = bool(last.get("ich_above_cloud", False))
+        return {"trend_ok": trend_ok, "breakout_up": False, "breakdown": False}
+
+    last = dfw.iloc[-1]
+    prev = dfw.iloc[-2]
+
+    trend_ok = bool(last.get("ich_above_cloud", False))
+    breakout_up = bool(last.get("ich_breakout_up", False)) or (
+        trend_ok and not bool(prev.get("ich_above_cloud", False))
+    )
+    breakdown = bool(last.get("ich_breakdown_from_above", False))
+
+    return {
+        "trend_ok": trend_ok,
+        "breakout_up": breakout_up,
+        "breakdown": breakdown,
+    }
+
 # ================== 스캐너/레짐 ==================
 def pick_universe_by_krw_volume() -> List[str]:
     markets = get_markets_krw()
@@ -752,63 +829,93 @@ def track_buy_signals(universe: List[str]):
     pv = portfolio_value_krw()
     regime = btc_regime_factor()
     base_target = pv * PORTFOLIO_BUY_RATIO
+
     for m in universe:
+        # 이미 큰 비중 보유 시 추가 매수 제한
         if m in owned and owned[m] * get_current_price_safe(m) > pv * 0.25:
             continue
+        # 직전 매수 쿨다운
         if m in last_buy_time and time.time() - last_buy_time[m] < COOLDOWN_PERIOD_BUY:
             continue
+        # 직전 손실 후 쿨다운
         if m in last_loss_time and time.time() - last_loss_time[m] < COOLDOWN_AFTER_LOSS_SEC:
             continue
+
         sp = get_orderbook_spread_pct(m)
         if sp > SPREAD_MAX_PCT:
             continue
 
-        df3 = add_indicators(get_ohlcv(m, "3m", 200))
-        df15 = add_indicators(get_ohlcv(m, "15m", 200))
-        if df3.empty or df15.empty or len(df3) < 3:
+        # 1순위 필터: 주봉 일목구름 (클라우드 위에 있는 종목만 롱 진입)
+        ich_state = get_weekly_ichimoku_state(m)
+        if not ich_state["trend_ok"]:
+            # 주봉이 클라우드 위가 아니면 매수하지 않음 (거시 추세 역행 방지)
             continue
 
-        cur = float(safe_val(df3, "trade_price", -1, np.nan))
-        prev = float(safe_val(df3, "trade_price", -2, np.nan))
+        # 거시 타임프레임 기반 보조 지표 (4시간/1시간)
+        df4h = add_indicators(get_ohlcv(m, "240m", 200))
+        df1h = add_indicators(get_ohlcv(m, "60m", 200))
+        if df4h.empty or df1h.empty or len(df4h) < 3 or len(df1h) < 3:
+            continue
+
+        # 1시간봉 기준 단기 모멘텀 확인
+        cur = float(safe_val(df1h, "trade_price", -1, np.nan))
+        prev = float(safe_val(df1h, "trade_price", -2, np.nan))
         if np.isnan(cur) or np.isnan(prev) or prev <= 0:
             continue
         chg1 = (cur - prev) / prev * 100
 
-        rsi = float(safe_val(df3, "rsi", -1, np.nan))
-        macd_now = float(safe_val(df3, "macd", -1, np.nan))
-        macd_sig_now = float(safe_val(df3, "macd_signal", -1, np.nan))
-        macd_prev = float(safe_val(df3, "macd", -2, np.nan))
-        sig_prev = float(safe_val(df3, "macd_signal", -2, np.nan))
-        golden = (macd_now > macd_sig_now) and (macd_prev <= sig_prev)
+        # 4시간/1시간 RSI, MACD, 추세 확인
+        rsi_4h = float(safe_val(df4h, "rsi", -1, np.nan))
+        rsi_1h = float(safe_val(df1h, "rsi", -1, np.nan))
 
-        ema20_3 = float(safe_val(df3, "ema20", -1, np.nan))
-        ema20_prev = float(safe_val(df3, "ema20", -2, np.nan))
-        ema_break = (prev < ema20_prev) and (cur > ema20_3)
+        macd_now_4h = float(safe_val(df4h, "macd", -1, np.nan))
+        macd_sig_now_4h = float(safe_val(df4h, "macd_signal", -1, np.nan))
+        macd_prev_4h = float(safe_val(df4h, "macd", -2, np.nan))
+        sig_prev_4h = float(safe_val(df4h, "macd_signal", -2, np.nan))
+        golden_4h = (macd_now_4h > macd_sig_now_4h) and (macd_prev_4h <= sig_prev_4h)
 
-        st15 = bool(safe_val(df15, "supertrend", -1, False))
-        ema20_15 = float(safe_val(df15, "ema20", -1, np.nan))
-        ema50_15 = float(safe_val(df15, "ema50", -1, np.nan))
-        higher_ok = st15 or (ema20_15 > ema50_15)
+        ema20_4h = float(safe_val(df4h, "ema20", -1, np.nan))
+        ema50_4h = float(safe_val(df4h, "ema50", -1, np.nan))
+        ema_trend_4h = (ema20_4h > ema50_4h)
 
-        in_bull_fvg = bool(safe_val(df3, "in_bull_fvg", -1, False))
-        ls_down = bool(safe_val(df3, "liquidity_sweep_down", -1, False))
-        discount_zone = bool(safe_val(df3, "discount_zone", -1, False))
-        in_ote = bool(safe_val(df3, "in_ote_long", -1, False))
-        ict_confluence = (in_bull_fvg or ls_down) and (discount_zone or in_ote)
+        st4h = bool(safe_val(df4h, "supertrend", -1, False))
 
-        if not np.isnan(rsi) and rsi > RSI_MAX_ENTRY:
+        in_bull_fvg_4h = bool(safe_val(df4h, "in_bull_fvg", -1, False))
+        ls_down_4h = bool(safe_val(df4h, "liquidity_sweep_down", -1, False))
+        discount_zone_4h = bool(safe_val(df4h, "discount_zone", -1, False))
+        in_ote_4h = bool(safe_val(df4h, "in_ote_long", -1, False))
+
+        # 과한 단기 급등 & 과열 구간 필터 (거시 기준으로 완화)
+        # 1시간 단기 급등/과열 + 4시간 과열 모두 체크
+        if (not np.isnan(rsi_1h) and rsi_1h > RSI_MAX_ENTRY) or (not np.isnan(rsi_4h) and rsi_4h > RSI_MAX_ENTRY - 5):
             continue
-        if chg1 > CHASE_UP_PCT_BLOCK:
+        if chg1 > (CHASE_UP_PCT_BLOCK * 0.7):  # 초단기(3분) 대비 완화하되, 과도한 추격은 여전히 차단
             continue
 
-        momentum_ok = golden or (ema_break and (rsi >= 35) and (rsi <= RSI_MAX_ENTRY))
-        buy_ok = momentum_ok and higher_ok and ict_confluence
+        # 보조 지표 기반 매수 로직 (거시 타임프레임 점수제)
+        score = 0
+        # 4시간 모멘텀 (MACD 골든 or EMA20>EMA50)
+        if golden_4h or ema_trend_4h:
+            score += 1
+        # 4시간 추세 (Supertrend)
+        if st4h:
+            score += 1
+        # ICT 관점 유리 구간 (4시간 FVG, 유동성 스윕, 할인/OTE)
+        if in_bull_fvg_4h or ls_down_4h or discount_zone_4h or in_ote_4h:
+            score += 1
+        # 4시간 RSI가 무리 없는 매수 존일 때 (과도한 저점/고점 회피)
+        if not np.isnan(rsi_4h) and 35 <= rsi_4h <= (RSI_MAX_ENTRY - 10):
+            score += 1
+
+        # 기준 점수 이상 + 주봉 일목 추세 OK 일 때만 진입
+        buy_ok = score >= 2
         if not buy_ok:
             continue
 
-        atr_val = float(safe_val(df3, "atr", -1, np.nan))
+        # 리스크 계산은 4시간 ATR 기준으로 (변동성을 주봉/일봉 보다 더 민감하게 반영)
+        atr_val = float(safe_val(df4h, "atr", -1, np.nan))
         if np.isnan(atr_val) or atr_val <= 0:
-            atr_val = cur * 0.01  # fallback
+            atr_val = cur * 0.02  # 4시간 기준 fallback (약 2%)
 
         # 리스크 기반 금액
         risk_amount = _risk_budget_krw(cur, atr_val)
@@ -818,6 +925,7 @@ def track_buy_signals(universe: List[str]):
         if target_amt < MINIMUM_ORDER_KRW:
             continue
 
+        # 기본은 지정가, 급격한 변동 시 place_limit_then_maybe_market 내부에서 시장가 전환
         limit_px = round_to_tick(cur * (1 + LIMIT_OFFSET_BUY))
         res = place_limit_then_maybe_market("bid", m, krw_amount=target_amt, limit_price=limit_px)
         if not res or "uuid" not in res:
@@ -834,8 +942,8 @@ def track_buy_signals(universe: List[str]):
         buy_prices[m] = entry
         highest_prices[m] = cur
 
-        # 초기 리스크 거리/스톱, TP 플래그
-        stop_pct = abs(FIXED_STOP_LOSS)/100.0
+        # 초기 리스크 거리/스톱, TP 플래그 (4시간 ATR 기준)
+        stop_pct = abs(FIXED_STOP_LOSS) / 100.0
         init_dist = max(entry * stop_pct, atr_val * ATR_SL_MULT)
         position_meta[m] = {
             "entry": entry,
@@ -845,14 +953,21 @@ def track_buy_signals(universe: List[str]):
             "tp1_done": 0.0,
             "tp2_done": 0.0,
             "entered_at": time.time(),
-            "stop": max(0.0, entry - init_dist)  # 초기 스톱
+            "stop": max(0.0, entry - init_dist),
         }
 
         slip_report = ""
         if limit_px > 0:
             slip = ((entry - limit_px) / limit_px) * 100
             slip_report = f" / 슬리피지:{slip:.2f}%"
-        send_slack_message(f"[매수] {m} / 금액: {target_amt:.0f} KRW / 체결가(VWAP): {entry:.2f}{slip_report} / ICT FVG:{in_bull_fvg} OTE:{in_ote} Dsc:{discount_zone} / 리스크:{init_dist:.4f}")
+
+        ichi_info = f"IchiTrend:{'UP' if ich_state['trend_ok'] else 'N/A'} BreakOut:{'Y' if ich_state.get('breakout_up') else 'N'}"
+        ict_info = f"4h_FVG:{in_bull_fvg_4h} OTE:{in_ote_4h} Dsc:{discount_zone_4h}"
+        rsi_4h_str = f"{rsi_4h:.2f}" if not np.isnan(rsi_4h) else "nan"
+        send_slack_message(
+            f"[매수] {m} / 금액: {target_amt:.0f} KRW / 체결가(VWAP): {entry:.2f}{slip_report} "
+            f"/ {ict_info} / 4h_RSI:{rsi_4h_str} / 리스크:{init_dist:.4f} / {ichi_info}"
+        )
 
 def should_trail_stop(high: float, cur: float, pct: float) -> bool:
     if high <= 0 or np.isnan(high) or np.isnan(cur):
@@ -880,11 +995,18 @@ def track_sell_signals():
         return
 
     for m, vol in owned.items():
-        df3 = add_indicators(get_ohlcv(m, "3m", 200))
-        if df3.empty or len(df3) < 3:
+        # 거시 타임프레임 기반 청산 판단 (4시간/1시간)
+        df4h = add_indicators(get_ohlcv(m, "240m", 200))
+        df1h = add_indicators(get_ohlcv(m, "60m", 200))
+        if df4h.empty or len(df4h) < 3:
             continue
 
-        cur = float(safe_val(df3, "trade_price", -1, np.nan))
+        # 주봉 일목구름 상태 (1순위 방향성 필터)
+        ich_state = get_weekly_ichimoku_state(m)
+        ich_breakdown = ich_state.get("breakdown", False)
+
+        # 가격은 가급적 더 민감한 1시간 봉에서 확인, 없으면 4시간 기준
+        cur = float(safe_val(df1h, "trade_price", -1, np.nan)) if not df1h.empty else float(safe_val(df4h, "trade_price", -1, np.nan))
         if np.isnan(cur):
             continue
 
@@ -899,25 +1021,27 @@ def track_sell_signals():
             highest_prices[m] = max(highest_prices[m], cur)
 
         pnl_pct = (cur - avg) / avg * 100 if avg > 0 else 0.0
-        atr = float(safe_val(df3, "atr", -1, np.nan))
-        st_now = bool(safe_val(df3, "supertrend", -1, False))
-        st_prev = bool(safe_val(df3, "supertrend", -2, False))
-        macd = float(safe_val(df3, "macd", -1, np.nan))
-        macd_sig = float(safe_val(df3, "macd_signal", -1, np.nan))
-        macd_prev = float(safe_val(df3, "macd", -2, np.nan))
-        sig_prev = float(safe_val(df3, "macd_signal", -2, np.nan))
-        death = (macd < macd_sig) and (macd_prev >= sig_prev)
 
-        in_bear_fvg = bool(safe_val(df3, "in_bear_fvg", -1, False))
-        ls_up = bool(safe_val(df3, "liquidity_sweep_up", -1, False))
-        premium_zone = bool(safe_val(df3, "premium_zone", -1, False))
-        ict_bearish = (in_bear_fvg and premium_zone) or ls_up
+        # 4시간 기준 ATR 및 추세/모멘텀
+        atr = float(safe_val(df4h, "atr", -1, np.nan))
+        st_now_4h = bool(safe_val(df4h, "supertrend", -1, False))
+        st_prev_4h = bool(safe_val(df4h, "supertrend", -2, False))
+        macd_4h = float(safe_val(df4h, "macd", -1, np.nan))
+        macd_sig_4h = float(safe_val(df4h, "macd_signal", -1, np.nan))
+        macd_prev_4h = float(safe_val(df4h, "macd", -2, np.nan))
+        sig_prev_4h = float(safe_val(df4h, "macd_signal", -2, np.nan))
+        death_4h = (macd_4h < macd_sig_4h) and (macd_prev_4h >= sig_prev_4h)
+
+        in_bear_fvg_4h = bool(safe_val(df4h, "in_bear_fvg", -1, False))
+        ls_up_4h = bool(safe_val(df4h, "liquidity_sweep_up", -1, False))
+        premium_zone_4h = bool(safe_val(df4h, "premium_zone", -1, False))
+        ict_bearish_4h = (in_bear_fvg_4h and premium_zone_4h) or ls_up_4h
 
         meta = position_meta.get(m, None)
         if meta:
             # BE 이동 체크
             _maybe_be_move(m, cur)
-            # 스톱 히트 여부
+            # 스톱 히트 여부 (손절/익절 비율에 상관 없이 강제 청산)
             stop_line = meta.get("stop", 0.0)
             if stop_line > 0 and cur <= stop_line:
                 qty = vol
@@ -940,32 +1064,40 @@ def track_sell_signals():
         ratio = 1.0
         reason = ""
 
+        # 1차 방어: ATR/고정 손절 (4시간 변동성 기준 강한 손절 시그널)
         if not np.isnan(atr) and (avg - cur) > atr * ATR_SL_MULT:
-            sell, ratio, reason = True, 1.0, f"ATR 손절({pnl_pct:.2f}%)"
+            sell, ratio, reason = True, 1.0, f"4h ATR 손절({pnl_pct:.2f}%)"
         elif pnl_pct <= FIXED_STOP_LOSS:
             sell, ratio, reason = True, 1.0, f"고정 손절({pnl_pct:.2f}%)"
 
+        # 2차: 주봉 일목구름 하락 시그널 (클라우드 위에서 안/아래로 재진입) → 전량 청산
+        elif ich_breakdown:
+            sell, ratio, reason = True, 1.0, "주봉 일목구름 하락(클라우드 재진입/하회)"
+
         else:
-            # R 기반 부분익절
+            # 3차: R 기반 부분익절 로직 (거시 기준 비율은 동일)
             if meta:
                 r_mult = _r_multiples(meta, cur)
                 if (not meta.get("tp1_done")) and r_mult >= TP1_R:
                     sell, ratio, reason = True, 0.5, f"1R 부분익절({pnl_pct:.2f}%)"
                     meta["tp1_done"] = 1.0
-                    # BE 이동 트리거
                     _maybe_be_move(m, cur)
                 elif (not meta.get("tp2_done")) and r_mult >= TP2_R:
                     sell, ratio, reason = True, 0.5, f"2R 추가익절({pnl_pct:.2f}%)"
                     meta["tp2_done"] = 1.0
 
         if not sell:
-            # 추세 반전/모멘텀 약화
-            if st_prev and not st_now:
-                sell, ratio, reason = True, 0.7, "Supertrend 반전"
-            elif death:
-                sell, ratio, reason = True, 0.5, "MACD 데드크로스"
-            elif ict_bearish:
-                sell, ratio, reason = True, 1.0, "ICT 베어리시"
+            # 4차: 추세 반전/모멘텀 약화 및 ICT 시그널 (4시간 기준)
+            strong_combo = ict_bearish_4h and (death_4h or (st_prev_4h and not st_now_4h))
+            if strong_combo:
+                # 강한 복합 매도 시그널 → 전량 청산
+                sell, ratio, reason = True, 1.0, "강한 복합 매도 시그널(ICT+추세, 4h)"
+            elif st_prev_4h and not st_now_4h:
+                sell, ratio, reason = True, 0.7, "4h Supertrend 반전"
+            elif death_4h:
+                sell, ratio, reason = True, 0.5, "4h MACD 데드크로스"
+            elif ict_bearish_4h:
+                sell, ratio, reason = True, 1.0, "4h ICT 베어리시"
             elif should_trail_stop(highest_prices[m], cur, TRAILING_STOP_PCT):
                 sell, ratio, reason = True, 1.0, "트레일링 스탑"
 
@@ -976,6 +1108,7 @@ def track_sell_signals():
         if qty * cur < MINIMUM_ORDER_KRW:
             continue
 
+        # 기본은 지정가, 급격한 변동 시 place_limit_then_maybe_market 내부에서 시장가 전환
         limit_px = round_to_tick(cur * (1 + LIMIT_OFFSET_SELL))
         res = place_limit_then_maybe_market("ask", m, limit_price=limit_px, volume=qty)
         if not res or "uuid" not in res:
@@ -994,7 +1127,10 @@ def track_sell_signals():
         if limit_px > 0:
             slip = ((limit_px - exec_price) / limit_px) * 100
             slip_report = f" / 슬리피지:{slip:.2f}%"
-        send_slack_message(f"[매도] {m} / 수량:{exec_qty:.6f} / 체결가(VWAP):{exec_price:.2f} / PnL:{profit:.0f} KRW / 누적:{total_profit:.0f} KRW / 사유:{reason}{slip_report}")
+        send_slack_message(
+            f"[매도] {m} / 수량:{exec_qty:.6f} / 체결가(VWAP):{exec_price:.2f} "
+            f"/ PnL:{profit:.0f} KRW / 누적:{total_profit:.0f} KRW / 사유:{reason}{slip_report}"
+        )
 
         # 전량 청산된 경우 메타 제거
         bal_after, _ = get_balance(m)
