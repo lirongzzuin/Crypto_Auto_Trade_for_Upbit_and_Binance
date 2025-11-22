@@ -33,10 +33,10 @@ ALERT_COOLDOWN_SECONDS = 7200
 
 # 감시할 코인 목록 및 가격 조건
 crypto_alerts = [
-    {"symbol": "BTCUSDT", "above": 125000, "below": 95000},
-    {"symbol": "ETHUSDT", "above": 5000, "below": 3000},
+    {"symbol": "BTCUSDT", "above": 120000, "below": 99000},
+    {"symbol": "ETHUSDT", "above": 6000, "below": 4000},
     {"symbol": "XRPUSDT", "above": 5, "below": 2},
-    {"symbol": "SOLUSDT", "above": 230, "below": 150},
+    {"symbol": "SOLUSDT", "above": 250, "below": 180},
     {"symbol": "ADAUSDT", "above": 1, "below": 0.5}
 ]
 
